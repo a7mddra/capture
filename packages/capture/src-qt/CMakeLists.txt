@@ -42,7 +42,7 @@ elseif(APPLE)
     endif()
     set(PLATFORM_LIBS ${FOUNDATION_LIB} ${COREGRAPHICS_LIB} ${COCOA_LIB} ${APPKIT_LIB})
 elseif(UNIX AND NOT APPLE)
-    list(APPEND SOURCES src/Capture_Unix.cpp src/Window.cpp)
+    list(APPEND SOURCES src/Capture_Linux.cpp src/Window.cpp)
     set(PLATFORM_LIBS Qt6::DBus)
 endif()
 
