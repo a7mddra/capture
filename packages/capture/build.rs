@@ -1,73 +1,87 @@
-// capture/build.rs
+// build.rs
+
 use std::env;
-use std::fs;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use walkdir::WalkDir;
+use zip::write::FileOptions;
 
 fn main() {
+    // 1. Define Paths
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let root = Path::new(&manifest_dir);
-    
-    // 1. Where is the C++ Engine?
-    let qt_dist = root.join("dist"); // The output of your PKGBUILD
-    
-    // 2. Where should the Zip go?
-    // We put it in 'src' so 'include_bytes!' can find it easily.
-    let output_zip = root.join("src/capture_kit.zip");
+    let dist_path = Path::new(&manifest_dir).join("dist");
+    let embed_dir = Path::new(&manifest_dir).join("src").join("embed");
+    let output_zip = embed_dir.join("capture_engine.zip");
 
-    // Tell Cargo to re-run if the C++ build changes
-    println!("cargo:rerun-if-changed={}", qt_dist.display());
+    // 2. Trigger Re-run only if 'dist' changes
+    println!("cargo:rerun-if-changed=dist");
 
     // 3. Validation
-    if !qt_dist.exists() {
-        // You can make this a hard error, or a warning if you want to allow 
-        // "rust-only" dev (daemon logic only) without the engine.
-        println!("cargo:warning=⚠️ C++ Engine not found at {:?}. Run PKGBUILD first!", qt_dist);
-        return; 
+    if !dist_path.exists() {
+        // If dist doesn't exist, we might be in a "clean" state or just starting.
+        // We create a dummy zip to allow 'cargo check' to pass, but warn heavily.
+        println!("cargo:warning=DIST FOLDER MISSING. Creating dummy payload.");
+        create_dummy_zip(&output_zip);
+        return;
     }
 
-    // 4. Zip It Up
-    // Since we are "Fearless", let's use the system zip command 
-    // (or 7z on Win) to avoid extra Rust dependencies for build-time only.
-    
-    // Cleanup old zip
-    if output_zip.exists() {
-        let _ = fs::remove_file(&output_zip);
+    // 4. Create the Embed Directory if missing
+    if !embed_dir.exists() {
+        std::fs::create_dir_all(&embed_dir).expect("Failed to create embed dir");
     }
 
-    #[cfg(unix)]
-    {
-        // zip -r -j src/capture_kit.zip dist/* // (-j ignores directory structure, but we want the structure inside dist)
-        // Actually, better to just zip the CONTENTS of dist.
+    // 5. Compress 'dist' contents into the zip
+    compress_dist(&dist_path, &output_zip);
+}
+
+fn compress_dist(src_dir: &Path, dst_file: &Path) {
+    let file = File::create(dst_file).expect("Failed to create zip file");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored) // Faster extract, slightly larger
+        .unix_permissions(0o755); // Ensure executable
+
+    let walk = WalkDir::new(src_dir);
+    let buffer = &mut Vec::new();
+
+    for entry in walk.into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
         
-        let status = Command::new("zip")
-            .current_dir(&qt_dist)
-            .arg("-r")
-            .arg(&output_zip)
-            .arg(".") // Zip everything in dist
-            .status()
-            .expect("Failed to run zip");
+        // Skip the root dir itself
+        if path == src_dir { continue; }
 
-        if !status.success() {
-            panic!("Failed to zip C++ engine");
+        let name = path.strip_prefix(src_dir).unwrap().to_str().unwrap();
+
+        // Write entry
+        if path.is_file() {
+            // Preserve executable permissions on Unix/Mac
+            #[cfg(unix)]
+            let options = {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::metadata(path).unwrap();
+                options.unix_permissions(meta.permissions().mode())
+            };
+
+            zip.start_file(name, options).unwrap();
+            let mut f = File::open(path).unwrap();
+            f.read_to_end(buffer).unwrap();
+            zip.write_all(buffer).unwrap();
+            buffer.clear();
+        } else if !name.is_empty() {
+            zip.add_directory(name, options).unwrap();
         }
     }
+    zip.finish().unwrap();
+}
 
-    #[cfg(windows)]
-    {
-        // PowerShell zip command
-        let status = Command::new("powershell")
-            .arg("-Command")
-            .arg(format!(
-                "Compress-Archive -Path '{}/*' -DestinationPath '{}' -Force",
-                qt_dist.display(),
-                output_zip.display()
-            ))
-            .status()
-            .expect("Failed to run powershell zip");
-            
-         if !status.success() {
-            panic!("Failed to zip C++ engine");
-        }
+fn create_dummy_zip(dst_file: &Path) {
+    if let Some(parent) = dst_file.parent() {
+        std::fs::create_dir_all(parent).unwrap();
     }
+    let file = File::create(dst_file).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("README.txt", FileOptions::default()).unwrap();
+    zip.write_all(b"Dummy payload. Run Qt build first.").unwrap();
+    zip.finish().unwrap();
 }

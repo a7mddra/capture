@@ -8,6 +8,8 @@ repository = "https://github.com/a7mddra/spatialshot.git"
 license = "Apache-2.0"
 
 [dependencies]
+zip = "0.6"          # Used at build time for compression
+walkdir = "2.4"      # To recursively find files in dist/
 anyhow = "1.0"
 home = "0.5"
 fs2 = "0.4"
@@ -17,13 +19,20 @@ dirs = "6.0.0"
 parking_lot = "0.12"
 env_logger = "0.11"
 log = "0.4"
-regex = "1.10"
+regex = "1.10" # Used at runtime for extraction
+sha2 = "0.10"        # For verifying integrity (optional but recommended)
+hex = "0.4"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rdev = "0.5.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23" 
+
+[build-dependencies]
+zip = "0.6"          # Used at build time for compression
+walkdir = "2.4"      # To recursively find files in dist/
+anyhow = "1.0"
 
 [profile.release]
 lto = true
