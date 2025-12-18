@@ -1,0 +1,78 @@
+name: 'Testing: CI'
+
+on:
+  # push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # =========================================================
+  # JOB 1: BUILD PKG (RUST)
+  # =========================================================
+  build-daemon:
+    name: Daemon ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux-x64
+          - os: windows-latest
+            name: Windows-x64
+          - os: macos-15-intel
+            name: macOS-Intel
+          - os: macos-latest
+            name: macOS-ARM
+            
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        uses: ./.github/actions/build-daemon
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-artifact-${{ matrix.name }}
+          path: dist-out/*
+
+  # =========================================================
+  # JOB 2: BUILD CAPTURE (C++/QT)
+  # =========================================================
+  build-capture:
+    name: Capture ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux-x64
+          - os: windows-latest
+            name: Windows-x64
+          - os: macos-15-intel
+            name: macOS-Intel
+          - os: macos-latest
+            name: macOS-ARM
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        uses: ./.github/actions/build-capture
+      
+      - name: Ad-Hoc Sign (Mac)
+        if: runner.os == 'macOS'
+        working-directory: packages/capture
+        run: |
+          echo "🔏 Ad-Hoc Signing Capture.app..."
+          codesign --force --deep --options runtime -s - dist/capture.app
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capture-artifact-${{ matrix.name }}
+          path: dist-out/*
