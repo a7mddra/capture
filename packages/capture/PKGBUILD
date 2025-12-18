@@ -92,7 +92,7 @@ if [ "$OS" == "Darwin" ]; then
     MACDEPLOYQT="$QT_BIN_PATH/macdeployqt"
     
     cp -R "$APP_BUNDLE" "$DIST_DIR/"
-    "$MACDEPLOYQT" "$DIST_DIR/capture.app" -dmg -always-overwrite -verbose=1
+    "$MACDEPLOYQT" "$DIST_DIR/capture.app" -always-overwrite -verbose=1
     
     log "macOS Deployment Complete."
 
