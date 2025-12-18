@@ -17,17 +17,38 @@ pub fn run(executable: &Path) -> Result<PathBuf> {
 
     info!("Launching capture engine: {:?}", executable);
 
-    // We pass the desired output path to the C++ engine as an argument.
-    // Ensure your Qt app reads argv[1] and saves the image there!
     let mut child = Command::new(executable)
-        .arg(output_path.to_string_lossy().to_string()) 
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
 
     // Register PID for the MonitorGuard (Ghost Buster) so it can kill this specific process
     set_capture_pid(child.id());
 
-    let status = child.wait()?;
+    let mut status = None;
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                status = Some(s);
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    set_capture_pid(0);
+                    return Err(anyhow!("Capture process timed out after 30 seconds"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                set_capture_pid(0);
+                return Err(anyhow!("Error waiting for process: {}", e));
+            }
+        }
+    }
+    let status = status.unwrap();
     
     // Reset PID since process is dead
     set_capture_pid(0);

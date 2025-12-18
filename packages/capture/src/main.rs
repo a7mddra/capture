@@ -37,7 +37,7 @@ fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         info!("Linux mode: Executing capture immediately...");
-        match lib::launcher::run_capture(&engine_path) {
+        match lib::capture::run(&engine_path) {
             Ok(image_path) => {
                 info!("Capture successful: {:?}", image_path);
                 ipc::tauri::open_editor(&image_path)?;

@@ -7,4 +7,4 @@ pub const PAYLOAD_ZIP: &[u8] = include_bytes!("embed/capture_engine.zip");
 /// Critical for the "Matryoshka" extraction logic.
 /// If you update the Qt engine, BUMP THIS VERSION.
 /// This forces the client to delete the old AppData folder and re-extract.
-pub const ENGINE_VERSION: &str = "v1.0.0-alpha.1";
+include!("embed/version_hash.rs");

@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use walkdir::WalkDir;
 use zip::write::FileOptions;
+use sha2::{Digest, Sha256};
 
 fn main() {
     // 1. Define Paths
@@ -13,6 +14,7 @@ fn main() {
     let dist_path = Path::new(&manifest_dir).join("dist");
     let embed_dir = Path::new(&manifest_dir).join("src").join("embed");
     let output_zip = embed_dir.join("capture_engine.zip");
+    let version_file = embed_dir.join("version_hash.rs");
 
     // 2. Trigger Re-run only if 'dist' changes
     println!("cargo:rerun-if-changed=dist");
@@ -20,9 +22,18 @@ fn main() {
     // 3. Validation
     if !dist_path.exists() {
         // If dist doesn't exist, we might be in a "clean" state or just starting.
+        
+        // CRITICAL CHECK: In Release mode, we cannot ship a dummy.
+        if env::var("PROFILE").unwrap() == "release" {
+             panic!("⛔ FATAL: 'dist' folder missing in RELEASE build. Compile C++ first!");
+        }
+
         // We create a dummy zip to allow 'cargo check' to pass, but warn heavily.
         println!("cargo:warning=DIST FOLDER MISSING. Creating dummy payload.");
         create_dummy_zip(&output_zip);
+        
+        // Write dummy version to ensure compilation passes
+        write_version_file(&version_file, "dummy-dev-version");
         return;
     }
 
@@ -33,6 +44,23 @@ fn main() {
 
     // 5. Compress 'dist' contents into the zip
     compress_dist(&dist_path, &output_zip);
+
+    // 6. Calculate Hash and Write Version
+    let hash = calculate_sha256(&output_zip);
+    write_version_file(&version_file, &hash);
+}
+
+fn write_version_file(path: &Path, version: &str) {
+    let content = format!("pub const ENGINE_VERSION: &str = \"{}\";", version);
+    let mut file = File::create(path).expect("Failed to create version file");
+    file.write_all(content.as_bytes()).expect("Failed to write version file");
+}
+
+fn calculate_sha256(path: &Path) -> String {
+    let mut file = File::open(path).expect("Failed to open zip for hashing");
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).expect("Failed to read zip for hashing");
+    hex::encode(hasher.finalize())
 }
 
 fn compress_dist(src_dir: &Path, dst_file: &Path) {

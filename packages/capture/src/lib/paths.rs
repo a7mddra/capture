@@ -10,5 +10,6 @@ pub fn get_app_data_dir() -> Result<PathBuf> {
 }
 
 pub fn get_temp_image_path() -> PathBuf {
-    std::env::temp_dir().join("spatialshot_latest.png")
+    // MUST match the hardcoded string in DrawView.cpp
+    std::env::temp_dir().join("spatial_capture.png") 
 }

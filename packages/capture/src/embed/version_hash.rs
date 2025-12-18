@@ -1,0 +1,1 @@
+pub const ENGINE_VERSION: &str = "dummy-dev-version";

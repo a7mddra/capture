@@ -86,7 +86,7 @@ fn install_engine(target_dir: &std::path::Path) -> Result<()> {
     // macOS Quarantine Fix
     #[cfg(target_os = "macos")]
     {
-        remove_quarantine(target_dir);
+        remove_quarantine(target_dir)?;
     }
 
     Ok(())
@@ -105,13 +105,18 @@ fn get_binary_path(base_dir: &std::path::Path) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn remove_quarantine(path: &std::path::Path) {
+fn remove_quarantine(path: &std::path::Path) -> Result<()> {
     // recursively remove the "com.apple.quarantine" attribute
     // This prevents "App is damaged" or "Downloaded from internet" popups
-    let _ = std::process::Command::new("xattr")
+    let status = std::process::Command::new("xattr")
         .arg("-r")
         .arg("-d")
         .arg("com.apple.quarantine")
         .arg(path)
-        .output();
+        .status()?;
+        
+    if !status.success() {
+        return Err(anyhow::anyhow!("Failed to strip quarantine attributes"));
+    }
+    Ok(())
 }
