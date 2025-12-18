@@ -313,29 +313,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daemon"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "core-graphics 0.23.2",
- "dirs",
- "env_logger",
- "fs2",
- "hex",
- "home",
- "log",
- "parking_lot",
- "rdev",
- "regex",
- "sha2",
- "sysinfo",
- "walkdir",
- "which",
- "windows 0.62.2",
- "zip",
-]
-
-[[package]]
 name = "deranged"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,6 +953,29 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "spatialshot-daemon"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "core-graphics 0.23.2",
+ "dirs",
+ "env_logger",
+ "fs2",
+ "hex",
+ "home",
+ "log",
+ "parking_lot",
+ "rdev",
+ "regex",
+ "sha2",
+ "sysinfo",
+ "walkdir",
+ "which",
+ "windows 0.62.2",
+ "zip",
+]
 
 [[package]]
 name = "subtle"

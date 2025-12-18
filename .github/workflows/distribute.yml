@@ -1,78 +1,108 @@
-name: 'Testing: CI'
+name: 'Distribution Build'
 
-on:
-  # push:
-  workflow_dispatch:
+on: workflow_dispatch
 
 permissions:
   contents: write
 
 jobs:
-  # =========================================================
-  # JOB 1: BUILD PKG (RUST)
-  # =========================================================
-  build-daemon:
-    name: Daemon ${{ matrix.name }}
+  build-unified:
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-20.04 # Use 20.04 for older glibc compatibility
             name: Linux-x64
+            shell: bash
           - os: windows-latest
             name: Windows-x64
-          - os: macos-15-intel
-            name: macOS-Intel
+            shell: pwsh
           - os: macos-latest
             name: macOS-ARM
-            
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build
-        uses: ./.github/actions/build-daemon
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: daemon-artifact-${{ matrix.name }}
-          path: dist-out/*
-
-  # =========================================================
-  # JOB 2: BUILD CAPTURE (C++/QT)
-  # =========================================================
-  build-capture:
-    name: Capture ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux-x64
-          - os: windows-latest
-            name: Windows-x64
-          - os: macos-15-intel
-            name: macOS-Intel
-          - os: macos-latest
-            name: macOS-ARM
+            shell: bash
+          # Add Intel Mac if needed
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build
-        uses: ./.github/actions/build-capture
+      # ==========================================
+      # PHASE 1: BUILD C++ CAPTURE ENGINE
+      # ==========================================
       
-      - name: Ad-Hoc Sign (Mac)
-        if: runner.os == 'macOS'
-        working-directory: packages/capture
+      # --- LINUX PREP ---
+      - name: (Linux) Install Qt & Build Deps
+        if: runner.os == 'Linux'
         run: |
-          echo "🔏 Ad-Hoc Signing Capture.app..."
-          codesign --force --deep --options runtime -s - dist/capture.app
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgl1-mesa-dev libxkbcommon-x11-0 libxcb-* libfontconfig1 libdbus-1-3
+          pip3 install aqtinstall
+          aqt install-qt linux desktop 6.6.0 gcc_64 --outputdir /opt/qt
+          echo "/opt/qt/6.6.0/gcc_64/bin" >> $GITHUB_PATH
+
+      # --- WINDOWS PREP ---
+      - name: (Windows) Install Qt & Ninja
+        if: runner.os == 'Windows'
+        run: |
+          winget install Kitware.CMake Ninja-build.Ninja --silent --accept-package-agreements --disable-interactivity
+          pip install aqtinstall
+          python -m aqt install-qt windows desktop 6.6.0 win64_msvc2019_64 --outputdir C:\Qt --archives qtbase qttools icu
+
+      # --- MAC PREP ---
+      - name: (macOS) Install Qt
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake qt
+          echo "$(brew --prefix qt)/bin" >> $GITHUB_PATH
+
+      # --- COMPILE C++ ---
+      - name: Compile Capture Engine
+        working-directory: packages/capture
+        shell: ${{ matrix.shell }}
+        run: |
+          # We use the raw scripts, assuming dependencies are now in PATH
+          if [ "$RUNNER_OS" == "Linux" ]; then
+             chmod +x PKGBUILD && ./PKGBUILD
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+             chmod +x PKGBUILD && ./PKGBUILD
+             # Sign the inner bundle immediately
+             codesign --force --deep --options runtime -s - dist/capture.app
+          else
+             .\PKGBUILD.ps1
+          fi
+
+      # ==========================================
+      # PHASE 2: BUILD RUST DAEMON (EMBEDS C++)
+      # ==========================================
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile Daemon (Matryoshka)
+        working-directory: packages/capture
+        shell: ${{ matrix.shell }}
+        run: |
+          # dist/ folder now exists from previous step
+          cargo build --release
+
+      # ==========================================
+      # PHASE 3: PACKAGE & UPLOAD
+      # ==========================================
+
+      - name: Package Artifacts
+        shell: bash
+        run: |
+          mkdir -p final-dist
+          
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cp packages/capture/target/release/spatialshot-daemon.exe final-dist/spatialshot-daemon.exe
+          else
+            cp packages/capture/target/release/spatialshot-daemon final-dist/spatialshot-daemon
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: capture-artifact-${{ matrix.name }}
-          path: dist-out/*
+          name: spatialshot-${{ matrix.name }}
+          path: final-dist/*
