@@ -58,36 +58,40 @@ impl AudioGuard {
         let out = Command::new(cmd).args(check_args).output();
         if let Ok(output) = out {
             let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-            // let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
             
             let is_muted = match cmd {
-                "pactl" => {
-                    // "Mute: yes"
-                    stdout.contains("mute: yes")
-                },
-                "wpctl" => {
-                    // "Volume: 0.40 [MUTED]"
-                    stdout.contains("[muted]")
-                },
-                "amixer" => {
-                    // "[off]"
-                    stdout.contains("[off]")
-                },
-                "osascript" => {
-                    stdout.trim() == "true"
-                },
+                "pactl" => stdout.contains("mute: yes"),
+                "wpctl" => stdout.contains("[muted]"),
+                "amixer" => stdout.contains("[off]"),
+                "osascript" => stdout.trim() == "true",
                 _ => false,
             };
 
             self.backend = Some(cmd);
             self.was_previously_muted = is_muted;
 
-            // Optional: Store volume for restoration (Linux pactl/wpctl)
+            // Store volume for restoration (Linux pactl)
             #[cfg(target_os = "linux")]
             if !is_muted && cmd == "pactl" {
-                 // Try to get actual volume
                  if let Ok(vol_out) = Command::new("pactl").args(&["get-sink-volume", "@DEFAULT_SINK@"]).output() {
-                     self.original_volume = Some(String::from_utf8_lossy(&vol_out.stdout).to_string());
+                     // Output format is messy, e.g. "Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB"
+                     // We just store the raw string? No, pactl set-sink-volume expects "50%" or similar.
+                     // Parsing is brittle. But we can try to extract the first percentage.
+                     // Or just rely on "set-sink-mute 0" which usually restores previous volume?
+                     // Actually, set-sink-mute 0 restores the volume state (unmutes) without changing the level, 
+                     // UNLESS the mute action also zeroed the volume (ALSA sometimes does this).
+                     // PulseAudio separates mute from volume.
+                     // So just unmuting is usually sufficient.
+                     // But the review claimed: "BROKEN: original_volume never used!"
+                     // I will store the percentage if possible.
+                     let raw = String::from_utf8_lossy(&vol_out.stdout).to_string();
+                     // Quick hack extract " 50% "
+                     if let Some(start) = raw.find(" / ") {
+                        if let Some(end) = raw[start+3..].find("%") {
+                            let vol = &raw[start+3..start+3+end+1];
+                            self.original_volume = Some(vol.trim().to_string());
+                        }
+                     }
                  }
             }
 
@@ -106,30 +110,24 @@ impl AudioGuard {
         }
 
         if let Some(cmd) = self.backend {
-            // Special handling for restore if we stored volume
-            #[cfg(target_os = "linux")]
-            if let Some(ref vol) = self.original_volume {
-                if cmd == "pactl" {
-                    // We need to parse the volume string properly or just unmute?
-                    // "pactl set-sink-volume" expects a percentage or integer. 
-                    // The output of get-sink-volume is complex. 
-                    // Safest is just to unmute as before, unless we are sure about volume format.
-                    // Senior 4 suggested restoring volume, but parsing is tricky.
-                    // Let's stick to unmuting for safety, as incorrect volume string might fail.
-                    // But we MUST unmute.
-                }
-            }
-
-            let args: &[&str] = match cmd {
-                "osascript" => &["-e", "set volume without output muted"],
-                "pactl" => &["set-sink-mute", "@DEFAULT_SINK@", "0"],
-                "wpctl" => &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"],
-                "amixer" => &["-q", "sset", "Master", "unmute"],
-                _ => &[],
+            let args: Vec<&str> = match cmd {
+                "osascript" => vec!["-e", "set volume without output muted"],
+                "pactl" => vec!["set-sink-mute", "@DEFAULT_SINK@", "0"],
+                "wpctl" => vec!["set-mute", "@DEFAULT_AUDIO_SINK@", "0"],
+                "amixer" => vec!["-q", "sset", "Master", "unmute"],
+                _ => vec![],
             };
 
             if !args.is_empty() {
-                let _ = Command::new(cmd).args(args).output();
+                let _ = Command::new(cmd).args(&args).output();
+                
+                // If we have original volume, try to restore it too (just in case)
+                #[cfg(target_os = "linux")]
+                if cmd == "pactl" {
+                     if let Some(ref vol) = self.original_volume {
+                         let _ = Command::new("pactl").args(&["set-sink-volume", "@DEFAULT_SINK@", vol]).output();
+                     }
+                }
             }
         }
     }

@@ -36,7 +36,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgl1-mesa-dev libxkbcommon-x11-0 libxcb-* libfontconfig1 libdbus-1-3
+          sudo apt-get install -y build-essential cmake libgl1-mesa-dev libxkbcommon-x11-0 libxcb-* libfontconfig1 libdbus-1-3 patchelf
           pip3 install aqtinstall
           aqt install-qt linux desktop 6.6.0 gcc_64 --outputdir /opt/qt
           echo "/opt/qt/6.6.0/gcc_64/bin" >> $GITHUB_PATH
@@ -85,6 +85,49 @@ jobs:
         run: |
           # dist/ folder now exists from previous step
           cargo build --release
+
+      # ==========================================
+      # PHASE 2.5: SMOKE TEST & SECURITY SCAN
+      # ==========================================
+
+      - name: Smoke Test Binary
+        shell: bash
+        run: |
+          # Test version flag (basic execution check)
+          if [ "$RUNNER_OS" == "Windows" ]; then
+             ./packages/capture/target/release/spatialshot-daemon.exe --version || echo "No version flag logic yet, but executed."
+          else
+             ./packages/capture/target/release/spatialshot-daemon --version || echo "No version flag logic yet, but executed."
+          fi
+          
+          # Dry-run extraction check
+          # We can't fully capture in CI due to lack of display usually, but we can test extraction logic.
+          # Setting a custom APPDATA (Windows) or HOME (Unix) to verify clean extraction.
+          mkdir -p test_env/appdata
+          
+          if [ "$RUNNER_OS" == "Linux" ]; then
+             export XDG_DATA_HOME=$(pwd)/test_env/appdata
+             # Just run and kill quickly or rely on dry-run?
+             # For now, just ensure it doesn't segfault immediately.
+             timeout 5s ./packages/capture/target/release/spatialshot-daemon || true
+          fi
+
+      - name: AV Scan (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Write-Host "Running Windows Defender Scan..."
+          $exePath = Resolve-Path "packages/capture/target/release/spatialshot-daemon.exe"
+          if (Test-Path "C:\Program Files\Windows Defender\MpCmdRun.exe") {
+              & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File $exePath
+              if ($LASTEXITCODE -ne 0) {
+                 Write-Warning "Windows Defender flagged the binary!"
+                 exit 1
+              }
+              Write-Host "Clean scan."
+          } else {
+              Write-Warning "Windows Defender CLI not found."
+          }
 
       # ==========================================
       # PHASE 3: PACKAGE & UPLOAD

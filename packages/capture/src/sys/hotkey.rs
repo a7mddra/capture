@@ -1,7 +1,11 @@
-// packages/capture/src/sys/hotkey.rs
+// src/sys/hotkey.rs
 
 use log::{error, info};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+
+// Prevent multiple capture threads from stacking up
+static CAPTURE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(target_os = "linux"))]
 pub fn listen<F>(callback_fn: F)
@@ -10,19 +14,21 @@ where
 {
     use rdev::{EventType, Key};
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::AtomicBool as AtomicBoolLocal,
         Arc,
     };
     use std::time::{Duration, Instant};
 
     info!("Starting Global Hotkey Listener (rdev)...");
 
-    let meta_down = Arc::new(AtomicBool::new(false));
-    let shift_down = Arc::new(AtomicBool::new(false));
+    let meta_down = Arc::new(AtomicBoolLocal::new(false));
+    let shift_down = Arc::new(AtomicBoolLocal::new(false));
     let last_trigger = Arc::new(parking_lot::Mutex::new(
         Instant::now() - Duration::from_secs(10),
     ));
 
+    // Optimize: Wrap callback in Arc to avoid huge clones if F is large,
+    // though F is usually a small closure capturing state.
     let callback = Arc::new(callback_fn);
 
     let m = meta_down.clone();
@@ -39,14 +45,21 @@ where
                         if m.load(Ordering::SeqCst) && s.load(Ordering::SeqCst) {
                             let mut last = t.lock();
                             if last.elapsed() >= Duration::from_millis(500) {
+                                
+                                // ATOMIC CHECK: If capture is already running, ignore.
+                                if CAPTURE_IN_PROGRESS.swap(true, Ordering::Acquire) {
+                                    info!("Hotkey ignored: Capture already in progress.");
+                                    return;
+                                }
+
                                 info!("Hotkey Detected: Meta+Shift+A");
                                 *last = Instant::now();
 
-                                // CRITICAL FIX: Spawn logic in a new thread.
-                                // Do not block the input listener!
                                 let cb_clone = callback.clone();
                                 thread::spawn(move || {
                                     (cb_clone)();
+                                    // Release lock when done
+                                    CAPTURE_IN_PROGRESS.store(false, Ordering::Release);
                                 });
                             }
                         }
