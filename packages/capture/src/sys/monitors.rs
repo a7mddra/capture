@@ -44,9 +44,11 @@ pub fn start_monitor() {
 
 fn emergency_shutdown(pid: u32) {
     let _ = kill_process(pid);
-    // Best-effort cleanup then exit to allow system to restore normal state
-    log::warn!("Exiting daemon due to monitor topology change.");
-    std::process::exit(1);
+    // REMOVED: std::process::exit(1); 
+    // REASON: Exiting here bypasses AudioGuard drop in main thread. 
+    // By just killing the child, main.rs will wake up from wait(), 
+    // handle the error, and drop AudioGuard naturally.
+    log::warn!("Killed capture process due to monitor topology change.");
 }
 
 pub(crate) fn kill_process(pid: u32) -> std::io::Result<()> {

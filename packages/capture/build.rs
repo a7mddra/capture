@@ -162,7 +162,15 @@ fn compress_dist(src_dir: &Path, dst_file: &Path) {
     let walk = WalkDir::new(src_dir);
     let mut buffer = Vec::new(); // Fix: proper buffer allocation
 
-    for entry in walk.into_iter().filter_map(|e| e.ok()) {
+    // 1. Collect entries first
+    let mut entries: Vec<_> = walk.into_iter()
+        .filter_map(|e| e.ok())
+        .collect();
+
+    // 2. Sort by path (Crucial for deterministic SHA256)
+    entries.sort_by(|a, b| a.path().cmp(b.path()));
+
+    for entry in entries {
         let path = entry.path();
         if path == src_dir { continue; }
         
