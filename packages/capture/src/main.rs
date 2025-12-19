@@ -37,6 +37,15 @@ fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         info!("Linux mode: Executing capture immediately...");
+        // Acquire lock for single instance on Linux too (though less critical for one-shot)
+        let _guard = match lib::lock::LockGuard::acquire() {
+            Ok(g) => g,
+            Err(_) => {
+                log::warn!("Capture already in progress.");
+                return Ok(());
+            }
+        };
+
         match lib::capture::run(&engine_path) {
             Ok(image_path) => {
                 info!("Capture successful: {:?}", image_path);
@@ -58,10 +67,14 @@ fn main() -> Result<()> {
         // 4. Start Listener
         sys::hotkey::listen(move || {
             // A. Acquire Lock (Single Instance per user)
-            if let Err(_) = lib::lock::try_lock() {
-                log::warn!("Capture already in progress. Ignoring hotkey.");
-                return;
-            }
+            // Using RAII guard ensures unlock happens even if we panic or error
+            let _guard = match lib::lock::LockGuard::acquire() {
+                Ok(g) => g,
+                Err(_) => {
+                    log::warn!("Capture already in progress. Ignoring hotkey.");
+                    return;
+                }
+            };
 
             // B. Mute Audio (The Silencer)
             let _audio_guard = sys::audio::AudioGuard::new();

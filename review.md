@@ -1,212 +1,45 @@
-i'm building a hybrid screenshot utility with native c++ and rust carrier.
-Spatialshot is an open-source "Circle to Search" desktop utility that brings the power of AI vision directly to your screen. It provides seamless screen capture by drawing not rect, analysis, and visual search capabilities with a single hotkey.
-
-tauri is done and production ready for shipping but before this we need it to ship some bags with him before leaving:
-
-### The Matryoshka Blueprint: From Source to Hotkey
-
-Here is the architectural flow of how I ship three worlds in one package without the user ever knowing.
-
-#### Phase 1: Construction (The Inner Doll 🪆)
-
-**Goal:** Turn the raw C++ code in `src-qt/` into a portable, standalone folder.
-
-1. **The Trigger:** I run `cargo build` inside `packages/capture`.
-2. **The Orchestrator:** `build.rs` wakes up first. It notices that `src-qt/` exists.
-3. **The Heavy Lifting:**
-* On **Windows**, `build.rs` executes `PKGBUILD.ps1`. This compiles `src-qt/` and runs `windeployqt` to gather all DLLs.
-* On **Unix**, `build.rs` executes `PKGBUILD`. This compiles `src-qt/` via CMake and gathers `.so`/`.dylib` dependencies using my custom dependency walker.
-
-
-4. **The Artifact:** The result is a folder named `dist/` containing the executable and all its libraries. This folder is "portable"—it can run anywhere.
-
-#### Phase 2: Encapsulation (The Middle Doll 🪆)
-
-**Goal:** Bake the portable `dist/` folder inside the Rust binary so it is invisible to the outside world.
-
-1. **The Compression:** `build.rs` (still running) takes the verified `dist/` folder and compresses it into a single blob: `src/embed/capture_kit.zip`.
-2. **The Embedding:** The Rust compiler (`rustc`) takes over. It compiles `src/main.rs`.
-3. **The Ingestion:** Inside `src/lib/bootstrap.rs`, the compiler finds the `include_bytes!` macro pointing to that zip file. It literally copies the zeros and ones of the zip file into the data segment of the Rust executable.
-4. **The Result:** I now have **one single binary** (let's call it `daemon`). It looks like a normal Rust program, but it is "pregnant" with the C++ engine.
-
-#### Phase 3: Shipping (The Outer Doll 🪆)
-
-**Goal:** Deliver this pregnant daemon to the user via Tauri.
-
-1. **The Handover:** I configure `packages/app` (Tauri) to treat my new `daemon` binary as an `externalBin`.
-2. **The Installer:** Tauri builds the installer (`.msi`, `.dmg`, `.deb`). It takes my `daemon` binary and places it inside the installation folder (e.g., inside `Program Files/SpatialShot/` or `SpatialShot.app/Contents/MacOS/`).
-3. **The Signing:** Since the C++ code is hidden inside the Rust binary, I only need to sign the Rust binary and the Tauri binary. (Note: On Mac, the internal signature remains valid because I signed it during Phase 1).
-
-#### Phase 4: Runtime (The Birth 🐣)
-
-**Goal:** The user runs the app, and the daemon deploys the capture engine just-in-time.
-
-1. **Startup:** The user opens SpatialShot. Tauri launches the `daemon` in the background.
-    NOTE: on linux: `daemon` isnt a background service. rdev works only for windows and macos as hotkey listener. instead tauri will run linux_hotkey_installer.sh in the installation step one time. it will add spatialshot in settings custome shortcuts so the OS is the background service that listens for hotkeys not daemon. but the hotkey will launch the daemon as orchestrator: daemon extracts c++ and mutes sound and captures and passes to tauri so it's the same as window/macos but without the hotkey part. also i have a robust bash script bundled in tauri (finished app) so put your focus on rust code.
-2. **The Check (Idempotency):** `src/main.rs` starts and calls `lib/bootstrap.rs`. It asks: *"Does `AppData/SpatialShot/capture-v1/` exist?"*
-3. **The Birth:**
-* **First Run:** "No." -> The daemon reads its own internal memory, extracts the zip to that `AppData` folder (we use appdata bcause AVs treat externalbin in %Temp% or sys32 as trojan virus), and sets execute permissions (and fixes Mac quarantine by xattr).
-* **Subsequent Runs:** "Yes." -> The daemon skips extraction immediately.
-
-
-4. **The Watch:** `sys/hotkey.rs` starts the global hotkey listener.
-5. **The Strike:**
-* User presses **Cmd/Win + shift + A**.
-* `sys/hotkey.rs` detects it OR linux detects <Super> + shift + A.
-* `src/main.rs` tells the OS to run the **C++ executable** sitting in `AppData`.
-* The C++ process spawns, freezes the screen, handles the "squiggle," saves the image, and dies.
-* `src/main.rs` picks up the result and sends it to Tauri.
-
-
-
-**Summary:** I compile three languages, but I ship one file. The user installs one app, but gets a complete suite. This is the Matryoshka Blueprint.
-
----
-
-i asked 5 senior devs to review the current codebase and i want you to apply there fixes.
-
 senior 1:
 ===
-This is a solid execution of the "dropper" pattern. You have correctly identified the three distinct phases.
+This architecture is solid. You have successfully implemented the "Matryoshka" pattern.
 
-**Architecture Rating: 9/10**
-You are trading **disk space** and **initial startup time** for **guaranteed environmental consistency**. This is the correct trade-off for a visual tool that relies on specific Qt versions and system libraries.
+**My Rating: 9/10.**
+You have solved the hardest part: cross-platform C++ dependency bundling without forcing the user to install Qt.
 
-However, I found **3 Critical Bugs** in your Rust code that will cause the app to hang, leave users with broken installations, or fail silently.
+However, I have found **4 Critical Bugs** in the Rust implementation that will cause:
 
-### 🔍 Critical Review Findings
+1. **Infinite Re-extraction loops** (due to non-deterministic zipping).
+2. **Corrupted installs on Windows** (due to non-atomic directory writes).
+3. **Zombie Processes** (monitor guard uses `kill -9` too aggressively).
+4. **Silent Failures** (Audio guard panic safety).
 
-1. **The Hotkey Deadlock (Severity: High):**
-In `src/sys/hotkey.rs`, you run the callback inside the `rdev` listen loop. `lib::capture::run` blocks the thread for up to 30 seconds (waiting for C++).
-* *Result:* While the screenshot is happening, the OS input event queue might get backed up, or the listener will simply stop responding to subsequent key releases (like releasing Shift), leaving the `AtomicBool` flags stuck in `true`.
-
-
-2. **Non-Atomic Extraction (Severity: Medium):**
-In `src/lib/bootstrap.rs`, you extract files one by one into the live `engine` folder.
-* *Result:* If the user forces close or the app crashes during unzip (byte 50 of 100MB), the next time they open it, `version.txt` might exist (or not), but the binaries will be half-written. The app will crash repeatedly.
-
-
-3. **The Build Script "Lie" (Severity: Low/DevOps):**
-Your description said "`build.rs` executes `PKGBUILD`". Your code **does not**. It only checks if `dist` exists and panics if missing in Release.
-* *Result:* You have to manually run the shell script every time you change C++ code. I will fix this to make it actually orchestrate the build.
-
-
+Here are the fixes.
 
 ---
 
-### 🛠️ The Fixes
+### 1. Fix `build.rs`: The Determinism Bug
 
-Here are the corrected files. Copy these over to fix the logic flaws.
+**The Problem:** `zip::FileOptions::default()` uses the *current timestamp* for files inside the zip.
+**The Consequence:** Every time you run `cargo build`, the zip binary changes, so the SHA256 hash changes. The client will think "New Version!" and re-extract the engine on *every single startup*, causing a 2-second delay.
 
-#### 1. Fixed `packages/capture/build.rs`
-
-*Now actually acts as an Orchestrator. It detects OS and runs the C++ build script automatically if `dist` is missing or `src-qt` changed.*
+**The Fix:** Force the timestamp to a constant (EPOCH).
 
 ```rust
 // packages/capture/build.rs
 
-use std::env;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::Path;
-use std::process::Command;
-use walkdir::WalkDir;
-use zip::write::FileOptions;
-use sha2::{Digest, Sha256};
+// ... (keep imports)
+use zip::DateTime; // Import this
 
-fn main() {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let root = Path::new(&manifest_dir);
-    let dist_path = root.join("dist");
-    let src_qt = root.join("src-qt");
-    let embed_dir = root.join("src").join("embed");
-    let output_zip = embed_dir.join("capture_engine.zip");
-    let version_file = embed_dir.join("version_hash.rs");
-
-    // 1. WATCH TRIGGERS
-    println!("cargo:rerun-if-changed=build.rs");
-    // Re-run if C++ source changes
-    println!("cargo:rerun-if-changed={}", src_qt.display());
-    // Re-run if dist changes (manual intervention)
-    println!("cargo:rerun-if-changed={}", dist_path.display());
-
-    // 2. BUILD ORCHESTRATION (The "Construction" Phase)
-    // If dist is missing OR we are in release mode and src-qt changed, rebuild C++.
-    if !dist_path.exists() || should_rebuild_cpp(&src_qt, &dist_path) {
-        println!("cargo:warning=Orchestrating C++ Build (this may take a while)...");
-        
-        let status = if cfg!(target_os = "windows") {
-             Command::new("powershell")
-                .arg("-ExecutionPolicy").arg("Bypass")
-                .arg("-File").arg("PKGBUILD.ps1")
-                .current_dir(root)
-                .status()
-        } else {
-             Command::new("./PKGBUILD")
-                .current_dir(root)
-                .status()
-        };
-
-        match status {
-            Ok(s) if s.success() => println!("cargo:warning=C++ Build Successful."),
-            _ => {
-                // In Debug, we can fallback to dummy. In Release, we die.
-                if env::var("PROFILE").unwrap() == "release" {
-                    panic!("⛔ FATAL: C++ Build Failed. Check logs.");
-                }
-                println!("cargo:warning=C++ Build Failed. Using DUMMY payload for Debug.");
-                create_dummy_zip(&output_zip);
-                write_version_file(&version_file, "dummy-error-fallback");
-                return;
-            }
-        }
-    }
-
-    // 3. COMPRESS (The "Encapsulation" Phase)
-    if !embed_dir.exists() {
-        std::fs::create_dir_all(&embed_dir).expect("Failed to create embed dir");
-    }
-
-    // Ensure we compress the FRESH dist
-    compress_dist(&dist_path, &output_zip);
-
-    // 4. HASH
-    let hash = calculate_sha256(&output_zip);
-    write_version_file(&version_file, &hash);
-}
-
-// Simple logic: If any file in src-qt is newer than dist, rebuild.
-fn should_rebuild_cpp(src: &Path, dist: &Path) -> bool {
-    // Basic check: if dist is empty, rebuild
-    if !dist.exists() { return true; }
-    // In a real scenario, you might compare mtimes, but for now, 
-    // we assume if the user ran cargo build, they might want to sync.
-    // However, C++ builds are slow, so we rely on explicit 'dist' existence usually.
-    // For now, strictly rely on dist existence to avoid infinite build loops 
-    // unless you implement a sophisticated mtime walker.
-    false 
-}
-
-fn write_version_file(path: &Path, version: &str) {
-    let content = format!("pub const ENGINE_VERSION: &str = \"{}\";", version);
-    let mut file = File::create(path).expect("Failed to create version file");
-    file.write_all(content.as_bytes()).expect("Failed to write version file");
-}
-
-fn calculate_sha256(path: &Path) -> String {
-    let mut file = File::open(path).expect("Failed to open zip for hashing");
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("Failed to read zip for hashing");
-    hex::encode(hasher.finalize())
-}
+// ... (keep main function)
 
 fn compress_dist(src_dir: &Path, dst_file: &Path) {
     let file = File::create(dst_file).expect("Failed to create zip file");
     let mut zip = zip::ZipWriter::new(file);
-    // Use stored (0) compression for speed since the binary will be zipped again by the installer usually
-    // Or Deflate for smaller binary size.
+
+    // FIXED: Use a constant time for determinism. 
+    // This ensures the SHA256 hash only changes when the FILE CONTENT changes.
     let options = FileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated) 
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(DateTime::default()) // 1980-01-01 00:00:00
         .unix_permissions(0o755);
 
     let walk = WalkDir::new(src_dir);
@@ -215,1578 +48,1092 @@ fn compress_dist(src_dir: &Path, dst_file: &Path) {
     for entry in walk.into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path == src_dir { continue; }
+        
         let name = path.strip_prefix(src_dir).unwrap().to_str().unwrap().replace("\\", "/");
 
         if path.is_file() {
-            #[cfg(unix)]
-            let options = {
-                use std::os::unix::fs::PermissionsExt;
-                let meta = std::fs::metadata(path).unwrap();
-                options.unix_permissions(meta.permissions().mode())
-            };
+            // ... (keep existing logic)
             zip.start_file(name, options).unwrap();
-            let mut f = File::open(path).unwrap();
-            f.read_to_end(buffer).unwrap();
-            zip.write_all(buffer).unwrap();
-            buffer.clear();
+            // ...
         } else if !name.is_empty() {
             zip.add_directory(name, options).unwrap();
         }
     }
     zip.finish().unwrap();
 }
-
-fn create_dummy_zip(dst_file: &Path) {
-    if let Some(parent) = dst_file.parent() { std::fs::create_dir_all(parent).unwrap(); }
-    let file = File::create(dst_file).unwrap();
-    let mut zip = zip::ZipWriter::new(file);
-    zip.start_file("README.txt", FileOptions::default()).unwrap();
-    zip.write_all(b"Dummy payload.").unwrap();
-    zip.finish().unwrap();
-}
+// ... (keep rest)
 
 ```
 
-#### 2. Fixed `packages/capture/src/lib/bootstrap.rs`
+---
 
-*Implements Atomic Extraction (The Transactional Birth). Checks hash, unzips to temp, swaps folder.*
+### 2. Fix `bootstrap.rs`: The "Dropper" Bug
+
+**The Problem:** You extract directly to the target folder. If the app crashes (or user kills it) halfway through extraction, you leave a corrupted binary. Next run, the code sees the folder exists and tries to run a broken exe.
+**The Fix:** **Atomic Move.** Extract to `engine_tmp_uuid`. Verify it. Then `rename` to `engine`.
 
 ```rust
 // packages/capture/src/lib/bootstrap.rs
 
 use crate::embed::{ENGINE_VERSION, PAYLOAD_ZIP};
 use anyhow::{Context, Result};
-use log::{info, warn};
-use std::fs;
+use fs2::FileExt;
+use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+// Remove tempfile dependency here, we want manual control relative to the target dir
+use uuid::Uuid; 
 
 pub fn ensure_engine() -> Result<PathBuf> {
     let data_dir = dirs::data_local_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine AppData directory"))?
         .join("SpatialShot");
 
-    let engine_dir = data_dir.join("engine");
+    let engine_dir = data_dir.join("capture-v1"); // Version namespace helps with migration
     let version_marker = engine_dir.join("version.txt");
 
-    // 1. IDEMPOTENCY CHECK
-    // If version matches, we are good.
+    if let Some(parent) = engine_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // 1. Fast Path: Check if exists and valid
     if engine_dir.exists() {
-        if let Ok(current_ver) = fs::read_to_string(&version_marker) {
+        if let Ok(current_ver) = std::fs::read_to_string(&version_marker) {
             if current_ver.trim() == ENGINE_VERSION {
                 return get_binary_path(&engine_dir);
             }
         }
     }
 
-    // 2. ATOMIC EXTRACTION STRATEGY
-    // Extract to "engine_tmp_RANDOM" first.
-    let temp_dir = data_dir.join(format!("engine_tmp_{}", uuid::Uuid::new_v4()));
-    
-    // Clean up any old temps from previous failed runs
-    cleanup_old_temps(&data_dir);
+    // 2. Slow Path: Needs Extraction
+    // Acquire lock to prevent two daemons extracting simultaneously
+    let lock_path = data_dir.join(".install.lock");
+    let lock_file = File::create(&lock_path)?;
+    lock_file.lock_exclusive()?;
 
-    info!("Extracting engine ({}) to temporary location...", ENGINE_VERSION);
-    
-    match install_engine(&temp_dir) {
-        Ok(_) => {
-            // Write version inside temp before swap
-            fs::write(temp_dir.join("version.txt"), ENGINE_VERSION)?;
-
-            // 3. THE SWAP
-            if engine_dir.exists() {
-                // Windows rename fails if target exists, so we must remove first
-                let _ = fs::remove_dir_all(&engine_dir); 
-            }
-            
-            // Rename is atomic on POSIX, usually atomic on Windows (if no locks)
-            fs::rename(&temp_dir, &engine_dir).context("Failed to finalize engine extraction")?;
-            
-            info!("Engine deployment complete.");
-            get_binary_path(&engine_dir)
-        }
-        Err(e) => {
-            // Cleanup temp on failure
-            let _ = fs::remove_dir_all(&temp_dir);
-            Err(e)
-        }
-    }
-}
-
-fn cleanup_old_temps(base: &Path) {
-    if let Ok(entries) = fs::read_dir(base) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("engine_tmp_") {
-                    let _ = fs::remove_dir_all(path);
-                }
+    // Check again inside lock (Double-Checked Locking)
+    if engine_dir.exists() {
+        if let Ok(current_ver) = std::fs::read_to_string(&version_marker) {
+            if current_ver.trim() == ENGINE_VERSION {
+                lock_file.unlock()?;
+                return get_binary_path(&engine_dir);
             }
         }
+        // Invalid version, nuke it
+        let _ = std::fs::remove_dir_all(&engine_dir);
     }
-}
 
-// ... [install_engine and get_binary_path remain mostly the same, ensuring ZIP SLIP check matches previous file] ...
-// CRITICAL: Ensure install_engine handles the ZIP extraction exactly as you had it, 
-// just ensure target_dir is the temp_dir passed in.
+    log::info!("Extracting Capture Engine...");
 
-fn install_engine(target_dir: &Path) -> Result<()> {
-    fs::create_dir_all(target_dir)?;
+    // 3. Atomic Extraction Strategy
+    // Extract to "capture-v1-tmp-UUID" inside the same parent dir
+    // This ensures 'rename' is an atomic OS operation (same partition)
+    let tmp_dir_name = format!("capture-v1-tmp-{}", Uuid::new_v4());
+    let tmp_dir = data_dir.join(&tmp_dir_name);
+
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
     let mut archive = zip::ZipArchive::new(Cursor::new(PAYLOAD_ZIP))?;
-
+    
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         let outpath = match file.enclosed_name() {
-            Some(path) => target_dir.join(path),
+            Some(p) => tmp_dir.join(p),
             None => continue,
         };
 
         if file.name().ends_with('/') {
-            fs::create_dir_all(&outpath)?;
-        } else {
-            if let Some(p) = outpath.parent() {
-                if !p.exists() { fs::create_dir_all(p)?; }
-            }
-            let mut outfile = fs::File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)?;
+            std::fs::create_dir_all(&outpath)?;
+            continue;
         }
+
+        if let Some(p) = outpath.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+
+        let mut outfile = std::fs::File::create(&outpath)?;
+        std::io::copy(&mut file, &mut outfile)?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if let Some(mode) = file.unix_mode() {
-                fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
+                std::fs::set_permissions(&outpath, std::fs::Permissions::from_mode(mode))?;
             }
         }
     }
 
+    // 4. Sanitize (Mac Quarantine)
     #[cfg(target_os = "macos")]
     {
-        remove_quarantine(target_dir)?;
+        // Recursively remove quarantine from the TMP folder
+        let _ = std::process::Command::new("xattr")
+            .arg("-r").arg("-d").arg("com.apple.quarantine").arg(&tmp_dir)
+            .status(); 
     }
 
-    Ok(())
-}
-
-fn get_binary_path(base_dir: &Path) -> Result<PathBuf> {
-    if cfg!(target_os = "windows") {
-        Ok(base_dir.join("capture.exe"))
-    } else if cfg!(target_os = "macos") {
-        Ok(base_dir.join("capture.app").join("Contents").join("MacOS").join("capture"))
-    } else {
-        Ok(base_dir.join("capture-bin"))
+    // 5. Atomic Rename (The Commit)
+    // Windows rename fails if target exists, so we try remove first
+    if engine_dir.exists() {
+        std::fs::remove_dir_all(&engine_dir).context("Failed to clean old engine")?;
     }
+    
+    // Rename tmp -> actual
+    std::fs::rename(&tmp_dir, &engine_dir).context("Failed to rename engine dir")?;
+    
+    // Write version
+    std::fs::write(version_marker, ENGINE_VERSION)?;
+
+    lock_file.unlock()?;
+    get_binary_path(&engine_dir)
 }
 
-#[cfg(target_os = "macos")]
-fn remove_quarantine(path: &Path) -> Result<()> {
-    let status = std::process::Command::new("xattr")
-        .arg("-r").arg("-d").arg("com.apple.quarantine").arg(path)
-        .status(); // Don't check error rigorously, as it might not have the attr
+// ... (keep get_binary_path)
+
+```
+
+---
+
+### 3. Fix `sys/monitors.rs`: The Zombie Bug
+
+**The Problem:** `kill -9` (SIGKILL) does not allow the C++ app to clean up X11 connections or release shared memory.
+**The Fix:** Try `SIGTERM` (polite kill) first. Wait 200ms. Then `SIGKILL`.
+
+```rust
+// packages/capture/src/sys/monitors.rs
+
+// ... imports
+
+pub(crate) fn kill_process(pid: u32) -> std::io::Result<()> {
+    if pid == 0 { return Ok(()); }
+    
+    #[cfg(unix)]
+    {
+        // 1. Try SIGTERM (15) - Polite
+        let _ = Command::new("kill").arg("-15").arg(pid.to_string()).output();
+        
+        // 2. Give it a moment to die
+        thread::sleep(Duration::from_millis(200));
+
+        // 3. Check if still alive (signal 0 check)
+        let still_alive = Command::new("kill").arg("-0").arg(pid.to_string()).status().map(|s| s.success()).unwrap_or(false);
+
+        if still_alive {
+             // 4. SIGKILL (9) - Nuclear
+            Command::new("kill").arg("-9").arg(pid.to_string()).output()?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        // /T = Tree kill (kill child processes too)
+        // /F = Force
+        Command::new("taskkill")
+            .args(&["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()?;
+    }
     Ok(())
 }
 
 ```
 
-*Note: You need to add `uuid = { version = "1.0", features = ["v4"] }` to Cargo.toml for the temp folder naming.*
+---
 
-#### 3. Fixed `packages/capture/src/sys/hotkey.rs`
+### 4. Fix `sys/audio.rs`: The Panic Safety Bug
 
-*Fixes the Deadlock. Spawns a new thread for the heavy lifting so `rdev` can keep processing events.*
+**The Problem:** If the Rust daemon panics *while* the audio is muted, the user's computer remains muted forever.
+**The Fix:** We need to hook into the panic handler to ensure `AudioGuard` restores volume even on a crash. However, standard `Drop` handles panics in the same thread. But if `std::process::exit(1)` is called (like in your `monitors.rs` emergency shutdown), `Drop` is **NOT** called.
+
+**The Fix:**
+
+1. Remove `std::process::exit(1)` from `monitors.rs`. Use a shared `AtomicBool` to signal the main loop to break cleanly.
+2. Or, more simply, ensure `AudioGuard` un-mutes immediately after capture `wait()` returns.
+
+*Currently, your `main.rs` does this correctly by binding `_audio_guard` to the scope. Just be aware: Do not call `std::process::exit` while holding that guard.*
+
+---
+
+### Deployment & Packaging (CI)
+
+Your GitHub Actions look excellent.
+
+**One optimization for Windows:**
+In `PKGBUILD.ps1`, you rely on `windeployqt`.
+
+Be aware that `windeployqt` sometimes misses `plugins/styles` or `plugins/imageformats` if they aren't explicitly used in the code but required at runtime (e.g., loading a JPEG).
+Since you are freezing the screen (likely taking a BMP/PNG), verify `imageformats` folder is in your `dist/plugins`.
+
+**Packaging Security:**
+Since you are embedding `capture.exe` inside `spatialshot-daemon.exe`:
+
+1. **Sign the Inner:** In `PKGBUILD.ps1`, if you have a certificate, sign `dist/capture.exe` *before* it gets zipped.
+2. **Sign the Outer:** Tauri will sign the outer installer.
+This dual-signing helps AV heuristics realize the inner executable is trusted.
+
+### Next Step
+
+Would you like me to provide the **Rust code for the `linux_hotkey_installer.sh` logic**? Since you cannot use `rdev` on Linux Wayland/X11 reliably for global shortcuts, we need to programmatically insert a `.desktop` file or a `dconf` entry to bind `<Super>+Shift+A` to your daemon.
+===
+
+senior 2:
+===
+### Architecture Review Update
+Based on the provided code, I still support the Matryoshka architecture (8/10 rating from before). It elegantly embeds the C++ capture engine into the Rust daemon binary via `build.rs` and `include_bytes!`, making deployment via Tauri seamless. The code implements your blueprint well: `build.rs` orchestrates C++ builds (via PKGBUILD scripts), compresses `dist/` to zip, and generates a hash/version. Runtime extraction in `bootstrap.rs` is idempotent and atomic (tempdir + rename), with platform tweaks like Mac quarantine removal. The daemon's orchestration (hotkey listener on Win/Mac, one-shot on Linux) aligns with your flow, and guards (audio mute, monitor watchdog) add reliability.
+
+Minor architecture suggestions:
+- **Decoupling Potential:** If C++ updates become frequent, consider optional non-embedded mode (e.g., via env var) for devs, where `bootstrap.rs` loads from a local `dist/` instead.
+- **Linux Hotkey:** Your OS-shortcut approach is fine, but if you want daemon parity, explore `evdev` or `uinput` for Wayland—though it adds complexity and perms issues.
+- **Tauri Integration:** The `ipc/tauri.rs` custom protocol (`spatialshot://`) assumes Tauri registers it; ensure Tauri's `tauri.conf.json` has `"allowlist": { "protocol": { "asset": true } }` and a handler for the scheme.
+
+No major changes needed—it's shippable with the fixes below.
+
+### Rust Code Deep Review and Bug Fixes
+I'll review key modules/files, highlight strengths/bugs, and suggest fixes. Focus is on correctness, safety, performance, and platform quirks. I'll provide code snippets for fixes (diff-style where possible). Overall, the code is clean, uses good crates (e.g., `fs2` for locks, `dirs` for paths, `rdev` for hotkeys), and handles errors with `anyhow`. Dependencies in `Cargo.toml` are appropriate, though you could add `cfg-if` for more platform conditionals.
+
+#### 1. **build.rs** (Core of Embedding)
+**Strengths:** Handles platform-specific builds, compresses with deflate, hashes for integrity, dummy fallback for debug. `rerun-if-changed` for `dist/` is good for incremental builds.
+
+**Bugs/Issues:**
+- `should_rebuild_cpp` always returns `false` if `dist/` exists—ignores src-qt changes. This can lead to stale embeds.
+- `rerun-if-changed` for `src-qt` only on the dir, not recursive files (Cargo doesn't auto-recurse dirs).
+- `let buffer = &mut Vec::new();` — syntax error? Should be `let mut buffer = Vec::new();`.
+- On failure in release, panics—good, but log more.
+- No integrity check during build (e.g., verify zip after compress).
+- Unix permissions in zip: Good, but ensure executable bits for binaries.
+
+**Fixes/Suggestions:**
+- Make `should_rebuild_cpp` compare mtimes: Walk src-qt, find max mtime; compare to dist's min mtime.
+- Add recursive `rerun-if-changed` for src-qt files.
+- Fix buffer decl.
+- Add post-compress verify.
+
+Updated code snippets:
+```rust
+// Add at top:
+use std::fs::Metadata;
+use std::time::SystemTime;
+
+// In main, before if !dist_path.exists() || should_rebuild_cpp...
+// Add recursive rerun for src-qt
+for entry in WalkDir::new(&src_qt).into_iter().filter_map(|e| e.ok()) {
+    if entry.file_type().is_file() {
+        println!("cargo:rerun-if-changed={}", entry.path().display());
+    }
+}
+
+// Replace should_rebuild_cpp:
+fn should_rebuild_cpp(src: &Path, dist: &Path) -> bool {
+    if !dist.exists() {
+        return true;
+    }
+    let src_max_mtime = max_mtime(src).unwrap_or(SystemTime::UNIX_EPOCH);
+    let dist_min_mtime = min_mtime(dist).unwrap_or(SystemTime::now());
+    src_max_mtime > dist_min_mtime
+}
+
+fn max_mtime(path: &Path) -> Option<SystemTime> {
+    WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .filter_map(|m| m.modified().ok())
+        .max()
+}
+
+fn min_mtime(path: &Path) -> Option<SystemTime> {
+    WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .filter_map(|m| m.modified().ok())
+        .min()
+}
+
+// In compress_dist:
+let mut buffer = Vec::new();  // Fix: mutable vec
+
+// After zip.finish():
+// Verify
+let zip_file = File::open(dst_file).unwrap();
+let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+assert_eq!(archive.len() > 0, true, "Empty zip!");  // Basic check
+```
+
+#### 2. **Cargo.toml**
+**Strengths:** Conditional deps (e.g., rdev only non-linux), aggressive release profile for small binaries.
+
+**Issues:**
+- Duplicated deps (zip, walkdir, etc.) in [dependencies] and [build-dependencies]—unnecessary, but harmless.
+- No `rustflags` for static linking (e.g., musl on Linux)—your .cargo/config.toml handles it for musl.
+- Missing `[target.'cfg(target_os = "linux")'.dependencies]` if you add Linux-specific (e.g., for future hotkeys).
+
+**Suggestions:**
+- Remove dupes: Move zip/walkdir/sha2/hex to [build-dependencies] only if not used at runtime (but sha2/hex are runtime for verify? Wait, bootstrap doesn't verify hash yet—add it!).
+- Add `cfg-if` for cleaner platform code.
+- For deployment: Use `cargo-bundle` or integrate with Tauri build.
+
+#### 3. **src/embed.rs and src/lib/bootstrap.rs** (Embedding/Extraction)
+**Strengths:** Atomic extraction, version check forces re-extract, quarantine fix.
+
+**Issues:**
+- No runtime hash verify: Embed hash, but bootstrap doesn't check after extract.
+- Tempdir_in good, but if parent full, fails.
+- get_binary_path assumes fixed names—make configurable if needed.
+- On Windows, AppData/Local might need roaming for some users.
+
+**Fixes:**
+- Add hash check in ensure_engine after extract.
+- Use sha2 to verify.
+
+Snippet (in bootstrap.rs, after std::fs::rename):
+```rust
+// Calculate extracted hash (walk files, hash contents)
+let extracted_hash = calculate_dir_hash(&engine_dir)?;  // Implement similar to build.rs calculate_sha256 but for dir
+if extracted_hash != ENGINE_VERSION {
+    std::fs::remove_dir_all(&engine_dir)?;
+    return Err(anyhow!("Integrity check failed: hash mismatch"));
+}
+
+// New fn:
+fn calculate_dir_hash(dir: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for entry in WalkDir::new(dir).sort_by_file_name().into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            let mut f = File::open(entry.path())?;
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            hasher.update(&buf);
+        }
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+```
+
+#### 4. **src/sys/audio.rs** (Mute Guard)
+**Strengths:** RAII guard, tries multiple backends on Linux.
+
+**Bugs:**
+- is_muted heuristic is flawed: contains "[off]" could mean muted or not depending on backend.
+- For pactl: Parse "Mute: yes" exactly.
+- wpctl: Actually, `wpctl get-volume @DEFAULT_AUDIO_SINK@` outputs "Volume: 0.50 [MUTED]", so need to adjust command.
+- amixer: Parse "[off]" for muted.
+- osascript: "true" for muted.
+- No Windows? (Windows doesn't have shutter sound by default, but if needed, use winapi).
+
+**Fixes:**
+- Parse properly per backend.
+- For wpctl, use "status" or adjust.
+
+Updated try_backend (example for pactl):
+```rust
+fn try_backend(&mut self, cmd: &'static str, check_args: &[&str], mute_args: &[&str]) -> bool {
+    let out = Command::new(cmd).args(check_args).output();
+    if let Ok(output) = out {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        let is_muted = match cmd {
+            "pactl" => stdout.contains("mute: yes"),
+            "wpctl" => {  // Fix: wpctl get-volume
+                // Change check_args to &["get-volume", "@DEFAULT_AUDIO_SINK@"]
+                stdout.contains("[muted]")
+            },
+            "amixer" => stdout.contains("[off]"),
+            "osascript" => stdout.trim() == "true",
+            _ => false,
+        };
+        // ...
+    }
+    // Update check_args in new() accordingly, e.g., for wpctl: &["get-volume", "@DEFAULT_AUDIO_SINK@"]
+}
+```
+
+#### 5. **src/sys/monitors.rs** (Watchdog)
+**Strengths:** Polls efficiently, kills specifically, exits daemon.
+
+**Issues:**
+- Linux xrandr assumes X11; on Wayland, use `wlr-randr` or portal? But for count, `xdpyinfo` or assume.
+- 1s poll might miss fast plugs, but rare.
+- kill_process: On unix, check if kill succeeded.
+
+**Suggestions:**
+- On Linux Wayland: Fallback to `ls /sys/class/drm | grep -c card` for count.
+
+#### 6. **Other Modules**
+- **main.rs:** Solid. Add signal handling for clean exit?
+- **capture.rs:** Timeout good. Add stdout/err capture for debug.
+- **hotkey.rs:** Debounce good, thread spawn prevents blocking.
+- **lock.rs:** Good, but remove file on unlock for cleanup.
+- **ipc/tauri.rs:** Assumes protocol; add fallback to exec Tauri bin if not running.
+
+#### Packaging & Deployment
+- **Binary Size:** Release profile is great (~5-10MB post-strip with embed?).
+- **Cross-Compile:** Use `cross` crate for Win/Mac from Linux CI. Your .cargo/config.toml for musl good for static Linux bins.
+- **Tauri Integration:** In tauri.conf.json, add `"externalBin": ["spatialshot-daemon"]`. For Linux, bundle `linux_hotkey_installer.sh` as asset, run on install via Tauri's `setup` hook.
+- **CI Enhancements:** Your workflows are solid. Add artifact upload to releases. Use `cargo-deb` for .deb if not via Tauri.
+- **Testing:** Expand SMOKETEST to run daemon, simulate hotkey (e.g., via `xdotool` on Linux).
+- **Deployment Tips:** Sign daemon bin (codesign on Mac, signtool on Win). For AV, use AppData as you do. Test on VMs for platforms.
+
+With these fixes, it's robust—apply and test! If more code needed, provide Tauri part.
+===
+
+senior 3:
+===
+sick — this is solid work and I like the matryoshka idea. below i’ll be direct and practical: call out the real bugs / footguns in your Rust + packaging flow, give prioritized fixes you can paste, and recommend a few CI/packaging improvements. i focused only on the Rust/packaging/daemon bits (as you asked) — no C++ security review.
+
+---
+
+# High-level verdict (short)
+
+* **Architecture**: good. matryoshka fits your UX goals (single artifact) but requires extra CI/signing/AV effort. keep it if you accept the extra maintenance (notarization, bigger binary, CI complexity).
+* **Current Rust issues**: some real bugs that will break builds or produce races. easy fixes. main problem areas: `build.rs` (compilation bug & fragile logic), `lib::lock` (lifetime of lock), `bootstrap::get_binary_path` (wrong linux path), `monitors` (fragile Wayland detection + no debounce), `hotkey`/locking lifecycle (lock never released), `audio` heuristics (fragile parsing).
+
+I'll give targeted fixes in order of impact.
+
+---
+
+# 1) Critical build script bug (will fail to compile)
+
+Your `compress_dist` function uses `let buffer = &mut Vec::new();` — that borrows a temporary and won't compile. also handling of file permissions and options can be simplified.
+
+**Replace `compress_dist` with this** (drop-in):
 
 ```rust
-// packages/capture/src/sys/hotkey.rs
+fn compress_dist(src_dir: &Path, dst_file: &Path) {
+    use std::fs::OpenOptions;
+    use zip::result::ZipError;
 
-use log::{error, info};
-use std::thread;
+    if !src_dir.exists() {
+        panic!("dist folder missing: {}", src_dir.display());
+    }
+
+    let file = File::create(dst_file).expect("Failed to create zip file");
+    let mut zip = zip::ZipWriter::new(file);
+
+    let walk = WalkDir::new(src_dir);
+    let mut buffer = Vec::new();
+
+    for entry in walk.into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path == src_dir { continue; }
+        let name = path.strip_prefix(src_dir).unwrap().to_str().unwrap().replace("\\", "/");
+
+        if path.is_file() {
+            // fetch unix permissions per-file where available
+            let mut options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    options = options.unix_permissions(meta.permissions().mode());
+                }
+            }
+
+            zip.start_file(name, options).expect("zip start_file failed");
+            let mut f = File::open(path).expect("open source file failed");
+            buffer.clear();
+            f.read_to_end(&mut buffer).expect("read file failed");
+            zip.write_all(&buffer).expect("zip write failed");
+        } else if !name.is_empty() {
+            let dir_name = if name.ends_with('/') { name } else { format!("{}/", name) };
+            zip.add_directory(dir_name, FileOptions::default()).expect("add_directory failed");
+        }
+    }
+
+    zip.finish().expect("Failed to finish zip");
+}
+```
+
+**Why**: this fixes the temp reference bug, correctly preserves permissions where possible, and errors early if `dist` missing.
+
+---
+
+# 2) build.rs: tighten platform script invocation & rerun triggers
+
+* Don’t call scripts blindly — use `manifest_dir.join("PKGBUILD")` and `canonicalize()` so `Command` runs with full path.
+* `should_rebuild_cpp` currently always returns `false` — either implement mtime check or keep logic simple: rebuild when `dist` missing or when `CARGO_MANIFEST_DIR/src-qt` changed via `cargo:rerun-if-changed`. (You already print rerun-if-changed, so keep it simple and rebuild only when `dist` missing in CI.)
+
+Minor fixes (pseudocode):
+
+```rust
+let script = if cfg!(target_os = "windows") {
+    root.join("PKGBUILD.ps1")
+} else {
+    root.join("PKGBUILD")
+};
+let status = if cfg!(target_os = "windows") {
+    Command::new("powershell").arg("-ExecutionPolicy").arg("Bypass").arg("-File").arg(script)
+        .current_dir(root).status()
+} else {
+    Command::new(script).current_dir(root).status()
+};
+```
+
+Also **emit the sha in `version_hash.rs`** (you already do) — ensure `EXPECTED_SHA256` consumer uses same string.
+
+---
+
+# 3) `bootstrap::get_binary_path` — Linux path bug
+
+Your Linux artifact layout: `dist/` contains the runner script `capture` at top-level and `bin/capture-bin` inside. `get_binary_path` currently returns `engine_dir.join("capture-bin")` — that assumes top-level binary which is wrong for your runner script.
+
+**Replace `get_binary_path` with this robust logic**:
+
+```rust
+fn get_binary_path(base_dir: &std::path::Path) -> Result<PathBuf> {
+    if cfg!(target_os = "windows") {
+        let p = base_dir.join("capture.exe");
+        if p.exists() { return Ok(p); }
+        // fallback: try top-level exe names
+        Ok(base_dir.join("capture.exe"))
+    } else if cfg!(target_os = "macos") {
+        let app = base_dir.join("capture.app").join("Contents").join("MacOS").join("capture");
+        if app.exists() { return Ok(app); }
+        // fallback: try top-level "capture"
+        Ok(base_dir.join("capture"))
+    } else {
+        // linux: prefer top-level runner "capture", fallback to "bin/capture-bin"
+        let runner = base_dir.join("capture");
+        if runner.exists() { return Ok(runner); }
+        let bin = base_dir.join("bin").join("capture-bin");
+        if bin.exists() { return Ok(bin); }
+        // still fallback to top-level capture-bin
+        Ok(base_dir.join("capture-bin"))
+    }
+}
+```
+
+This avoids failing to find the runnable binary on Linux.
+
+---
+
+# 4) `lib::lock` lifetime bug — lock file can be dropped
+
+**Problem:** you create `File` and try to `OnceCell::set(file).ok()` ignoring failure — if `set` fails the file is dropped, lock released, and caller thinks it holds lock. also `OnceCell::set` on repeated runs returns Err; your code ignores it and proceeds. global lock handling should store the `File` so it lives until unlock.
+
+**Replace `lib::lock` with this pattern (safe & simple):**
+
+```rust
+use anyhow::Result;
+use fs2::FileExt;
+use std::fs::File;
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
+
+static GLOBAL_LOCK: Lazy<Mutex<Option<File>>> = Lazy::new(|| Mutex::new(None));
+
+pub fn try_lock() -> Result<()> {
+    let lock_path = std::env::temp_dir().join("spatialshot.lock");
+    let file = File::options().create(true).write(true).open(&lock_path)?;
+    file.try_lock_exclusive().context("Capture is already running")?;
+    let mut guard = GLOBAL_LOCK.lock().unwrap();
+    *guard = Some(file); // keep file alive until unlock
+    Ok(())
+}
+
+pub fn unlock() {
+    let mut guard = GLOBAL_LOCK.lock().unwrap();
+    if let Some(f) = guard.take() {
+        let _ = f.unlock();
+        // file is dropped here
+    }
+}
+```
+
+**Better**: implement a `LockGuard` RAII type:
+
+```rust
+pub struct LockGuard;
+impl LockGuard {
+    pub fn acquire() -> Result<Self> {
+        try_lock()?;
+        Ok(Self)
+    }
+}
+impl Drop for LockGuard {
+    fn drop(&mut self) { unlock(); }
+}
+```
+
+Then in your hotkey callback you do:
+
+```rust
+let _guard = match lib::lock::LockGuard::acquire() { Ok(g) => g, Err(_) => { log::warn!("already running"); return; } };
+// _guard will unlock on drop after capture completes or on panic
+```
+
+This guarantees unlock always runs even if capture fails.
+
+---
+
+# 5) hotkey callback: ensure lock is released (apply RAII)
+
+Currently you call `lib::lock::try_lock()` and never `unlock()` after capture. change to RAII guard (example above). update the listener callback in `main.rs` to use the guard:
+
+```rust
+sys::hotkey::listen(move || {
+    // Acquire guard
+    let guard = match lib::lock::LockGuard::acquire() {
+        Ok(g) => g,
+        Err(_) => {
+            log::warn!("Capture already in progress. Ignoring hotkey.");
+            return;
+        }
+    };
+
+    let _audio_guard = sys::audio::AudioGuard::new();
+
+    match lib::capture::run(&engine_path) {
+        Ok(image_path) => {
+            if let Err(e) = ipc::tauri::open_editor(&image_path) {
+                error!("Failed to open editor: {}", e);
+            }
+        }
+        Err(e) => error!("Capture execution failed: {}", e),
+    }
+    // guard dropped here -> unlock
+});
+```
+
+This fixes the lock-lingering bug (no more one-shot behavior).
+
+---
+
+# 6) `monitors` guard: debounce + Wayland handling + safer shutdown
+
+Your current monitor thread kills immediately on first topology change. that will create false-positive exits on transient changes. add a **debounce** and detect Wayland vs X11 to pick appropriate monitor check.
+
+Replace `start_monitor()` logic with:
+
+* Only run this watcher on platforms you can trust (macOS & X11). On Wayland, prefer to rely on the native capture engine to detect outputs (C++ is better for Wayland).
+* When a change is detected, wait a short grace window (e.g., 700–1500ms) and recheck. Only treat as real if stable.
+
+Patch (conceptual, pasteable):
+
+```rust
+pub fn start_monitor() {
+    thread::spawn(move || {
+        let mut last_count = get_monitor_count();
+        loop {
+            thread::sleep(Duration::from_millis(500));
+
+            let pid = get_capture_pid();
+            if pid == 0 {
+                last_count = get_monitor_count();
+                continue;
+            }
+
+            let current = get_monitor_count();
+            if current != last_count {
+                // debounce: wait a short window to allow OS reordering
+                thread::sleep(Duration::from_millis(800));
+                let confirm = get_monitor_count();
+                if confirm != current {
+                    // still unstable -> update and continue
+                    last_count = confirm;
+                    continue;
+                }
+
+                log::warn!("Display topology changed ({} -> {}). Emergency Shutdown.", last_count, current);
+                emergency_shutdown(pid);
+                return;
+            }
+        }
+    });
+}
+```
+
+And **Linux/Wayland detection** in `get_monitor_count()`:
+
+```rust
+#[cfg(target_os="linux")]
+fn get_monitor_count() -> i32 {
+    // Prefer X11 method when X is available
+    if std::env::var("XDG_SESSION_TYPE").map(|s| s.to_lowercase()).unwrap_or_default() == "wayland" {
+        // Wayland: we can't reliably parse xrandr. Return -1 to signal "unknown"
+        // Let the capture engine (C++) detect and handle Wayland hotplug and return fatal result.
+        return -1;
+    }
+
+    // X11 fallback using xrandr
+    if let Ok(out) = Command::new("xrandr").arg("--listmonitors").output() {
+        let lines = String::from_utf8_lossy(&out.stdout);
+        let count = lines.lines().next().and_then(|l| {
+            // header: "Monitors: N"
+            l.split_whitespace().nth(1)?.parse::<i32>().ok()
+        });
+        return count.unwrap_or(1);
+    }
+    1
+}
+```
+
+**Behavior note**: when `get_monitor_count()` returns `-1` (unknown) treat it as not comparable and skip guard. I recommend enabling monitor guard only on macOS and X11 Linux. rely on C++ for Wayland.
+
+---
+
+# 7) audio.rs: make Linux mute detection robust
+
+Your `try_backend` heuristics are fragile. for `pactl` better parse `Mute: yes/no` and for `wpctl` check `Muted: true/false`. Replace the heuristics for pactl with regex checking.
+
+Example improvement for pactl:
+
+```rust
+fn try_pactl(&mut self) -> bool {
+    if let Ok(out) = Command::new("pactl").args(&["get-sink-mute", "@DEFAULT_SINK@"]).output() {
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        // typical output: "Sink 0 'alsa_output.pci-0000_00_1f.3.analog-stereo' Mute: yes"
+        let is_muted = stdout.to_lowercase().contains("mute: yes") || stdout.to_lowercase().contains("mute: 1");
+        self.backend = Some("pactl");
+        self.was_previously_muted = is_muted;
+        if !is_muted {
+            let _ = Command::new("pactl").args(&["set-sink-mute", "@DEFAULT_SINK@", "1"]).output();
+            self.muted_by_us = true;
+        }
+        return true;
+    }
+    false
+}
+```
+
+Do similar for `wpctl` (check `wpctl get-volume` / `wpctl get-mute` patterns) and fall back to `amixer` parsing. Keep osascript on macOS.
+
+---
+
+# 8) child process lifetime & signal handling
+
+* Ensure the daemon forwards signals to the child (SIGTERM). On Unix, when the daemon receives SIGTERM, you should kill the capture child if still running and cleanly exit. Add signal handling using `ctrlc` or `signal-hook` crates and call `set_capture_pid(0)` after kill. This prevents orphaned children.
+
+Quick snippet (in `main` for non-linux):
+
+```rust
+// install signal handler (in main, before creating threads)
+let term_pid = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+{
+    let term_pid2 = term_pid.clone();
+    ctrlc::set_handler(move || {
+        term_pid2.store(true, Ordering::SeqCst);
+        let pid = sys::get_capture_pid();
+        if pid != 0 { let _ = sys::monitors::kill_process(pid); }
+        std::process::exit(0);
+    }).expect("Error setting Ctrl-C handler");
+}
+```
+
+---
+
+# 9) CI/packaging practical checklist (what to add next)
+
+* Use **platform-specific CI runners** to build the C++ engine on matching OS (you already do), but keep `build.rs` from trying to rebuild C++ on the runner — prefer CI builds to produce `dist/` then run `cargo build` as separate step (your workflow already stages that). keep those two steps separated and fail if `dist` missing.
+* **Codesign / notarize** on macOS in CI: use a secrets-managed mac signing cert (not `-s -`). notarize final installer.
+* **Windows signing**: sign inner exe before embedding (you already attempt). then sign final installer. Use osslsigncode in Linux runners if needed for cross-signing.
+* **AV smoke tests**: run the produced installer in clean VM (Windows Defender / Gatekeeper test) to detect false positives before public release. Add as manual gate.
+* **Artifacts**: produce separate `capture_kit.zip` as a release artifact in CI. That way you can reproduce builds and debug issues without embedding. (Option: for final release you can run a final job that downloads capture_kit.zip and compiles Rust with include_bytes! to produce final matryoshka binary.)
+
+---
+
+# 10) Small nitpicks & safety
+
+* `build.rs` currently prints `cargo:warning` on heavy steps — good. Ensure `build.rs` does not take too long on developer machines (document how to skip heavy built via `SKIP_CPP_BUILD=1` env var).
+* `bootstrap` uses `File::create(lock_path)` — if multiple users share same data dir (unlikely), use user-local. good.
+* consider using *atomic metadata file* for version marker (write to tmp then rename) — you already do for extraction but also write version file atomically.
+
+---
+
+# Paste-ready patches I recommend applying now
+
+1. replace `compress_dist` (snippet provided).
+2. replace `lib::lock` with `GLOBAL_LOCK` + LockGuard (snippet provided).
+3. replace `bootstrap::get_binary_path` (snippet provided).
+4. update main hotkey callback to use `LockGuard` RAII (snippet provided).
+5. replace `start_monitor` with debounced watcher and detect wayland (snippet provided).
+6. improve `try_backend` for `pactl` (snippet provided).
+
+If you want, I can produce full file diffs / PR-ready patches for each changed file. say which files you want patched first and i’ll spit out the exact patch content you can drop in — no waiting, i’ll produce them right here.
+
+---
+
+if you want me to continue: tell me which of the above patches you want full diffs for (i can produce `--- old` / `+++ new` style patches you can paste), or i can generate a single combined PR patch for the `packages/capture/src` Rust files (recommended).
+
+===
+
+senior 4:
+===
+Your architecture is brilliant and production-ready with some critical fixes. Let me review the Rust code and provide essential fixes:
+
+## 🔴 **CRITICAL BUGS TO FIX IMMEDIATELY**
+
+### **1. ZERO-CHECK HASH VULNERABILITY**
+```rust
+// FIX in bootstrap.rs - Add hash verification BEFORE extraction
+use sha2::{Sha256, Digest};
+
+fn extract_engine() -> Result<()> {
+    // BEFORE unzipping, verify embedded hash matches expected
+    let expected_hash = embed::ENGINE_VERSION;
+    let actual_hash = hex::encode(Sha256::digest(PAYLOAD_ZIP));
+    
+    if expected_hash != actual_hash {
+        return Err(anyhow!("Embedded engine corrupted! Expected: {}, Got: {}", 
+                          expected_hash, actual_hash));
+    }
+    // ... proceed with extraction
+}
+```
+
+### **2. LOCKING DEADLOCK ON LINUX**
+```rust
+// FIX in lock.rs - Linux needs flock, not just file creation
+#[cfg(unix)]
+fn try_lock() -> Result<()> {
+    use nix::fcntl::{flock, FlockArg};
+    use std::os::unix::io::AsRawFd;
+    
+    let lock_path = std::env::temp_dir().join("spatialshot.lock");
+    let file = File::create(&lock_path)?;
+    
+    // Use proper flock with LOCK_EX | LOCK_NB
+    flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock)
+        .map_err(|_| anyhow!("Capture already in progress"))?;
+    
+    LOCK_FILE.set(file).ok();
+    Ok(())
+}
+```
+
+### **3. RACE CONDITION IN AUDIO MUTE**
+```rust
+// FIX in audio.rs - Store original volume level, not just mute state
+struct AudioGuard {
+    #[cfg(target_os = "linux")]
+    original_volume: Option<String>,  // Store actual volume level
+    // ... other fields
+}
+
+impl AudioGuard {
+    fn try_backend(&mut self, cmd: &'static str, check_args: &[&str], mute_args: &[&str]) -> bool {
+        // Capture ACTUAL volume level, not just mute state
+        if cmd == "pactl" {
+            let get_vol = Command::new("pactl")
+                .args(&["get-sink-volume", "@DEFAULT_SINK@"])
+                .output()
+                .ok();
+            
+            if let Ok(output) = get_vol {
+                self.original_volume = Some(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+        }
+        // ... rest of logic
+    }
+    
+    fn restore(&self) {
+        if let Some(ref vol) = self.original_volume {
+            // Restore EXACT original volume, not just unmute
+            let _ = Command::new("pactl")
+                .args(&["set-sink-volume", "@DEFAULT_SINK@", vol.trim()])
+                .output();
+        }
+    }
+}
+```
+
+### **4. HOTKEY LISTENER BLOCKING RACE**
+```rust
+// FIX in hotkey.rs - Use tokio::spawn, not std::thread
+use tokio::runtime::Handle;
 
 #[cfg(not(target_os = "linux"))]
 pub fn listen<F>(callback_fn: F)
 where
     F: Fn() + Send + Sync + 'static,
 {
-    use rdev::{EventType, Key};
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
-    use std::time::{Duration, Instant};
-
-    info!("Starting Global Hotkey Listener (rdev)...");
-
-    let meta_down = Arc::new(AtomicBool::new(false));
-    let shift_down = Arc::new(AtomicBool::new(false));
-    let last_trigger = Arc::new(parking_lot::Mutex::new(
-        Instant::now() - Duration::from_secs(10),
-    ));
-
-    let callback = Arc::new(callback_fn);
-
-    let m = meta_down.clone();
-    let s = shift_down.clone();
-    let t = last_trigger.clone();
-
-    if let Err(error) = rdev::listen(move |event| {
-        match event.event_type {
-            EventType::KeyPress(key) => {
-                match key {
-                    Key::MetaLeft | Key::MetaRight => m.store(true, Ordering::SeqCst),
-                    Key::ShiftLeft | Key::ShiftRight => s.store(true, Ordering::SeqCst),
-                    Key::KeyA => {
-                        if m.load(Ordering::SeqCst) && s.load(Ordering::SeqCst) {
-                            let mut last = t.lock();
-                            if last.elapsed() >= Duration::from_millis(500) {
-                                info!("Hotkey Detected: Meta+Shift+A");
-                                *last = Instant::now();
-
-                                // CRITICAL FIX: Spawn logic in a new thread.
-                                // Do not block the input listener!
-                                let cb_clone = callback.clone();
-                                thread::spawn(move || {
-                                    (cb_clone)();
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            EventType::KeyRelease(key) => match key {
-                Key::MetaLeft | Key::MetaRight => m.store(false, Ordering::SeqCst),
-                Key::ShiftLeft | Key::ShiftRight => s.store(false, Ordering::SeqCst),
-                _ => {}
-            },
-            _ => {}
-        }
-    }) {
-        error!("Global listener error: {:?}", error);
-    }
-}
-
-```
-
-### 📦 Deployment Checklist
-
-1. **Dependencies:** Add `uuid` to your `packages/capture/Cargo.toml`.
-2. **Linux Shortcuts:** Since you are relying on `linux_hotkey_installer.sh` via Tauri, ensure your Tauri installer actually runs this post-install.
-* *Tip:* In `.deb`, use a `postinst` script. In AppImage, it's harder; you might need to run the check inside Tauri `main.rs` on startup ("Is shortcut registered? If not, register it").
-
-
-3. **MacOS Signing:** In your `distribute.yml`, you are signing `dist/capture.app` before embedding. **This is good.**
-* *Warning:* When `bootstrap.rs` extracts the app on the user's machine, the signature is preserved, BUT the `com.apple.quarantine` attribute invalidates it.
-* *Verification:* Your `remove_quarantine` function is the hero here. Ensure that `xattr` is available on the target user's path (it usually is /usr/bin/xattr).
-
-
-
-This architecture is robust. The Rust carrier acting as a "Just-In-Time" installer for the C++ engine solves the dependency hell of C++ distribution gracefully. Good luck shipping.
-===
-
-senior 2:
-===
-Excellent architecture! Your **Matryoshka Blueprint** is well-designed. I've analyzed your code and found several critical bugs and improvements needed. Here's my review:
-
-## 🚨 **CRITICAL BUGS TO FIX IMMEDIATELY**
-
-### **1. Race Condition in `lock.rs` - UNSAFE!**
-```rust
-// BUG: This is UNSAFE! Multiple threads can access this simultaneously
-static mut LOCK_FILE: Option<File> = None;  // ❌ NEVER use `static mut`
-
-pub fn try_lock() -> Result<()> {
-    // ... racing threads could create multiple lock files
-}
-```
-
-**Fix with `OnceLock` or `Mutex`:**
-```rust
-use std::sync::OnceLock;
-use parking_lot::Mutex;
-
-struct LockState {
-    file: Option<File>,
-    path: PathBuf,
-}
-
-static LOCK_STATE: OnceLock<Mutex<LockState>> = OnceLock::new();
-
-pub fn try_lock() -> Result<LockGuard> {
-    let state = LOCK_STATE.get_or_init(|| {
-        let path = std::env::temp_dir().join("spatialshot.lock");
-        Mutex::new(LockState { file: None, path })
-    });
+    // ... key detection logic
     
-    let mut guard = state.lock();
-    if guard.file.is_some() {
-        return Err(anyhow!("Already locked"));
-    }
-    
-    let file = File::create(&guard.path)?;
-    file.try_lock_exclusive()?;
-    guard.file = Some(file);
-    
-    Ok(LockGuard)  // Custom guard that unlocks on drop
-}
-```
-
-### **2. `CAPTURE_PID` Race Condition**
-```rust
-// In sys/mod.rs - This has a race condition!
-pub fn set_capture_pid(pid: u32) {
-    CAPTURE_PID.store(pid, Ordering::SeqCst);  // ❌ What if old process isn't dead?
-}
-```
-
-**Fix with PID tracking and validation:**
-```rust
-use sysinfo::{Pid, System};
-
-pub fn set_capture_pid(pid: u32) {
-    let old_pid = CAPTURE_PID.swap(pid, Ordering::SeqCst);
-    
-    // Clean up any stale process
-    if old_pid != 0 && old_pid != pid {
-        let sys = System::new_all();
-        if sys.process(Pid::from_u32(old_pid)).is_some() {
-            let _ = kill_process(old_pid);
-        }
+    if m.load(Ordering::SeqCst) && s.load(Ordering::SeqCst) {
+        let runtime = Handle::current();
+        runtime.spawn(async move {
+            (callback_fn)();
+        });
     }
 }
 ```
 
-### **3. **ZIP SLIP VULNERABILITY** in `bootstrap.rs`**
-Your code is vulnerable! Attackers could write files outside the target directory:
-
+### **5. MONITOR COUNT FUNCTION FAILS ON WAYLAND**
 ```rust
-// ❌ VULNERABLE: `enclosed_name()` doesn't prevent all attacks
-let outpath = match file.enclosed_name() {
-    Some(path) => target_dir.join(path),  // Still dangerous!
-    None => continue,
-};
-```
-
-**Fix with canonicalization check:**
-```rust
-use std::path::Path;
-
-fn is_safe_path(base: &Path, candidate: &Path) -> bool {
-    let base_canon = base.canonicalize().unwrap_or_default();
-    let cand_canon = candidate.canonicalize().unwrap_or_default();
-    cand_canon.starts_with(&base_canon)
-}
-
-// In extraction loop:
-let outpath = target_dir.join(file.name());
-if !is_safe_path(&target_dir, &outpath) {
-    return Err(anyhow!("Zip slip attempt detected: {}", file.name()));
-}
-```
-
-## 🐛 **MAJOR FUNCTIONALITY BUGS**
-
-### **4. Linux Hotkey Script Missing**
-Your architecture says Linux uses a bash script, but it's not implemented:
-
-```rust
-// Add this file: packages/capture/scripts/linux-hotkey-installer.sh
-#!/bin/bash
-# Registers Super+Shift+A with the desktop environment
-
-if command -v gsettings &> /dev/null; then
-    # GNOME
-    gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings \
-        "$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings | sed "s/\]/, '/org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/custom99']/")"
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/custom99/ name "'SpatialShot'"
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/custom99/ command "'/usr/bin/spatialshot-daemon --trigger'"
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/custom99/ binding "'<Super><Shift>a'"
-fi
-```
-
-### **5. Audio Guard Doesn't Restore State Properly**
-```rust
-// BUG: AudioGuard might restore incorrectly if system was already muted
-fn try_backend(&mut self, cmd: &'static str, check_args: &[&str], mute_args: &[&str]) -> bool {
-    // ... what if we fail to check but succeed in muting?
-}
-```
-
-**Fix with state persistence:**
-```rust
-use serde_json;
-use std::fs;
-
-struct AudioState {
-    backend: String,
-    was_muted: bool,
-    timestamp: u64,
-}
-
-impl AudioGuard {
-    fn save_state(&self) -> Result<()> {
-        let state = AudioState {
-            backend: self.backend.unwrap_or("unknown").to_string(),
-            was_muted: self.was_previously_muted,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-        };
-        
-        let state_path = dirs::cache_dir()
-            .unwrap()
-            .join("spatialshot-audio-state.json");
-        fs::write(state_path, serde_json::to_string(&state)?)?;
-        Ok(())
-    }
-}
-```
-
-### **6. Monitor Count on Linux is Wrong**
-```rust
-// BUG: `xrandr --listmonitors` output format varies
-fn get_monitor_count() -> i32 {
-    String::from_utf8_lossy(&out.stdout).lines().count() as i32 - 1
-    // This counts lines, not monitors!
-}
-```
-
-**Fix with proper parsing:**
-```rust
+// FIX in monitors.rs - Add Wayland support
 #[cfg(target_os = "linux")]
 fn get_monitor_count() -> i32 {
-    use std::process::Command;
+    // Check if we're on Wayland
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        // Use swaymsg or wlr-randr for Wayland
+        if let Ok(output) = Command::new("swaymsg").arg("-t").arg("get_outputs").output() {
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+            return json.as_array().map(|a| a.len()).unwrap_or(1) as i32;
+        }
+        // Fallback: check /sys/class/drm
+        let count = std::fs::read_dir("/sys/class/drm")
+            .map(|dir| dir.filter(|e| e.as_ref().map(|e| e.file_name().to_string_lossy().starts_with("card")).unwrap_or(false)).count())
+            .unwrap_or(1);
+        return count as i32;
+    }
     
-    // Method 1: XRandR
-    if let Ok(output) = Command::new("xrandr").arg("--listmonitors").output() {
-        let out = String::from_utf8_lossy(&output.stdout);
-        for line in out.lines() {
-            if line.starts_with("Monitors: ") {
-                if let Some(count) = line.split_whitespace().nth(1) {
-                    return count.parse().unwrap_or(1);
-                }
+    // Original X11 logic
+    // ... keep your xrandr parsing
+}
+```
+
+## 🟡 **ARCHITECTURE IMPROVEMENTS**
+
+### **6. BOOTSTRAP: ADD ROLLBACK ON FAILURE**
+```rust
+// Add to bootstrap.rs
+fn ensure_engine_with_rollback() -> Result<PathBuf> {
+    let engine_dir = /* ... */;
+    let backup_dir = engine_dir.with_extension("backup");
+    
+    // Before extraction, backup existing
+    if engine_dir.exists() {
+        std::fs::rename(&engine_dir, &backup_dir)?;
+    }
+    
+    match extract_engine() {
+        Ok(path) => {
+            // Success - delete backup
+            let _ = std::fs::remove_dir_all(backup_dir);
+            Ok(path)
+        }
+        Err(e) => {
+            // FAILED - restore backup
+            log::error!("Extraction failed: {}. Rolling back...", e);
+            let _ = std::fs::remove_dir_all(&engine_dir);
+            if backup_dir.exists() {
+                std::fs::rename(&backup_dir, &engine_dir)?;
+            }
+            Err(e)
+        }
+    }
+}
+```
+
+### **7. IPC: ADD FALLBACK MECHANISM**
+```rust
+// FIX in tauri.rs - Add retry logic
+use tokio::time::{sleep, Duration};
+
+pub fn open_editor_with_retry(image_path: &Path) -> Result<()> {
+    for attempt in 1..=3 {
+        match open_editor(image_path) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt == 3 => return Err(e),
+            Err(e) => {
+                log::warn!("IPC attempt {} failed: {}. Retrying...", attempt, e);
+                sleep(Duration::from_millis(500 * attempt)).await;
             }
         }
     }
+    unreachable!()
+}
+```
+
+### **8. CAPTURE: ADD HEARTBEAT CHECK**
+```rust
+// Add to capture.rs
+fn run_with_heartbeat(executable: &Path) -> Result<PathBuf> {
+    let (tx, rx) = std::sync::mpsc::channel();
     
-    // Method 2: X11 fallback
-    if let Ok(output) = Command::new("xdpyinfo").output() {
-        let out = String::from_utf8_lossy(&output.stdout);
-        for line in out.lines() {
-            if line.contains("number of screens:") {
-                if let Some(count) = line.split(':').nth(1) {
-                    return count.trim().parse().unwrap_or(1);
-                }
-            }
+    // Spawn heartbeat monitor
+    std::thread::spawn(move || {
+        let mut last_heartbeat = std::time::Instant::now();
+        while last_heartbeat.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(100));
         }
-    }
+        // No heartbeat for 5s - kill process
+        let _ = tx.send(());
+    });
     
-    1  // Fallback
+    // Your existing capture logic, but add heartbeat signals
+    // In C++ side: periodically write to a named pipe
 }
 ```
 
-## 🛠 **ARCHITECTURE IMPROVEMENTS**
+## ✅ **PACKAGING & DEPLOYMENT FIXES**
 
-### **7. Tauri IPC Needs Implementation**
-Your `tauri.rs` is just a stub:
-
-```rust
-// Add proper IPC
-use std::sync::mpsc;
-use std::thread;
-
-pub struct TauriClient {
-    tx: mpsc::Sender<IpcMessage>,
-}
-
-impl TauriClient {
-    pub fn new() -> Result<Self> {
-        // On macOS/Linux, use Unix domain sockets
-        // On Windows, use named pipes
-        #[cfg(unix)]
-        let socket_path = dirs::runtime_dir()
-            .unwrap()
-            .join("spatialshot-ipc.sock");
-            
-        #[cfg(windows)]
-        let pipe_name = r"\\.\pipe\spatialshot-ipc";
-        
-        Ok(Self { tx })
-    }
-    
-    pub fn send_capture(&self, image_path: &Path) -> Result<()> {
-        // Send via IPC, not just protocol handlers
-    }
-}
-```
-
-### **8. Add Health Checking**
-```rust
-// In main.rs, before starting daemon
-fn check_system_health() -> Result<()> {
-    // Check disk space for extraction
-    let data_dir = dirs::data_local_dir().unwrap();
-    let available = fs2::available_space(&data_dir)?;
-    if available < 200 * 1024 * 1024 {  // 200MB minimum
-        return Err(anyhow!("Insufficient disk space for capture engine"));
-    }
-    
-    // Check if C++ binary is executable
-    let engine_path = bootstrap::ensure_engine()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::metadata(&engine_path)?.permissions();
-        if perms.mode() & 0o111 == 0 {
-            return Err(anyhow!("Capture engine is not executable"));
-        }
-    }
-    
-    Ok(())
-}
-```
-
-### **9. Improve Error Messages for Users**
-```rust
-// Create user-friendly errors
-#[derive(thiserror::Error, Debug)]
-pub enum DaemonError {
-    #[error("Cannot start capture: another instance is running")]
-    AlreadyRunning,
-    #[error("Display configuration changed during capture")]
-    DisplayChanged,
-    #[error("Insufficient permissions to capture screen")]
-    PermissionsDenied,
-    #[error("Capture engine is corrupted. Please reinstall the application")]
-    EngineCorrupted,
-}
-
-impl From<DaemonError> for String {
-    fn from(err: DaemonError) -> Self {
-        // Convert to user-friendly message
-        format!("⚠️  SpatialShot Error: {}", err)
-    }
-}
-```
-
-## 📦 **PACKAGING FIXES**
-
-### **10. Cargo.toml Dependencies Need Fixing**
-```toml
-# FIX: Missing critical dependencies
-[dependencies]
-thiserror = "1.0"  # For proper error types
-tracing = "0.1"    # Structured logging
-tracing-subscriber = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tempfile = "3.8"   # Better temp file handling
-
-# Add platform-specific
-[target.'cfg(target_os = "linux")'.dependencies]
-x11rb = "0.12"  # For proper X11 monitoring
-
-# REMOVE: `fs2` is unmaintained, use `fs4`
-fs4 = "1.0"
-```
-
-### **11. Build.rs Needs Signal Handling**
-```rust
-// Add cleanup on build interruption
-fn main() {
-    // Handle Ctrl+C during build
-    ctrlc::set_handler(|| {
-        eprintln!("Build interrupted. Cleaning up...");
-        let _ = std::fs::remove_dir_all("dist");
-        std::process::exit(1);
-    }).expect("Error setting Ctrl-C handler");
-    
-    // ... rest of build
-}
-```
-
-### **12. Docker Improvements**
+### **9. DOCKER: ADD MULTI-ARCH SUPPORT**
 ```dockerfile
-# Add to Dockerfile
-RUN groupadd -r spatialshot && useradd -r -g spatialshot spatialshot
-USER spatialshot  # Don't run as root!
+# Update Dockerfile
+FROM --platform=$BUILDPLATFORM ubuntu:20.04 AS builder
 
-# Add healthcheck
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD [ "test", "-f", "/tmp/spatialshot-ready" ]
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+    dpkg --add-architecture arm64 && \
+    apt-get update && \
+    apt-get install -y crossbuild-essential-arm64; \
+    fi
+# ... rest of build
 ```
 
-## 🚀 **DEPLOYMENT FIXES**
-
-### **13. GitHub Actions Issues**
-```yaml
-# In distribute.yml, FIX these issues:
-
-# 1. Windows needs proper Qt path
-- name: (Windows) Set Qt Path
-  if: runner.os == 'Windows'
-  run: |
-    echo "Qt6_DIR=C:\Qt\${{ env.QT_VERSION }}\${{ env.QT_ARCH }}" >> $env:GITHUB_ENV
-    echo "PATH=$env:Qt6_DIR\bin;$env:PATH" >> $env:GITHUB_ENV
-
-# 2. macOS codesign needs identity
-- name: (macOS) Sign Bundle
-  if: runner.os == 'macOS'
-  run: |
-    codesign --force --deep --options runtime \
-      --sign "${{ secrets.MACOS_CERTIFICATE }}" \
-      dist/capture.app
-```
-
-### **14. Add Smoke Test Verification**
-```rust
-// Add test to verify extraction works
-#[test]
-fn test_engine_extraction() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let engine_dir = temp_dir.path().join("engine");
-    
-    // Test extraction with dummy zip
-    let result = std::panic::catch_unwind(|| {
-        bootstrap::extract_to(&engine_dir, DUMMY_ZIP)
-    });
-    
-    assert!(result.is_ok());
-    
-    // Verify executable exists
-    let exe = bootstrap::get_binary_path(&engine_dir).unwrap();
-    assert!(exe.exists());
-}
-```
-
-## ✅ **QUICK FIX CHECKLIST**
-
-1. **IMMEDIATE (Security)**:
-   - [ ] Fix ZIP slip vulnerability in `bootstrap.rs`
-   - [ ] Replace `static mut` with `OnceLock` in `lock.rs`
-   - [ ] Fix PID race condition in `sys/mod.rs`
-
-2. **HIGH PRIORITY (Functionality)**:
-   - [ ] Implement Linux hotkey installer script
-   - [ ] Fix monitor counting on Linux
-   - [ ] Complete Tauri IPC implementation
-   - [ ] Add proper audio state restoration
-
-3. **MEDIUM PRIORITY (Robustness)**:
-   - [ ] Add health checking before daemon starts
-   - [ ] Implement user-friendly error messages
-   - [ ] Add structured logging with `tracing`
-   - [ ] Create proper test suite
-
-4. **PACKAGING**:
-   - [ ] Update Cargo.toml dependencies
-   - [ ] Fix GitHub Actions workflows
-   - [ ] Add Docker health checks
-
-## 🎯 **ARCHITECTURE VERDICT: 8/10**
-
-Your Matryoshka architecture is **brilliant** but has critical safety bugs. Fix these and you'll have a production-ready system.
-
-**Key strengths:**
-- Single-binary deployment ✅
-- AV-friendly extraction location ✅
-- Platform-specific optimizations ✅
-- Good separation of concerns ✅
-
-**Critical weaknesses:**
-- Unsafe static variables ❌
-- ZIP slip vulnerability ❌
-- Incomplete Linux implementation ❌
-- Poor error handling ❌
-
-**Recommendation:** Fix the security issues first, then complete the Linux implementation. The architecture is sound but needs hardening.
-
-**Ready to implement these fixes?** I can provide detailed code for any specific fix you want to tackle first.
-===
-
-senior 3:
-===
-### Deep Rust Code Review, Bug Fixes, and Packaging/Deployment Recommendations
-
-Thanks for sharing the sources! I'll dive into a detailed review focused on the Rust components (as per your instructions: "rust review + packaging + deployment"). I'll go file-by-file where relevant, highlighting bugs, anti-patterns, strengths, and suggested fixes. I'll prioritize potential crashes, security (though not full audit), performance, and cross-platform reliability. Since this is embedded in a daemon for a hotkey-driven utility, I'll emphasize runtime stability and idempotency.
-
-Overall, the code is solid—clean modularization, good use of crates like `anyhow` for errors, and thoughtful platform cfg guards. However, there are some bugs (e.g., unsafe globals, path handling), missing error propagation, and deployment pitfalls (e.g., unsigned binaries, update handling). I'll rate each major file/section on a 1-10 scale for quick reference.
-
-If I suggest code changes, I'll provide snippets you can copy-paste. At the end, I'll confirm architecture support and suggest next steps.
-
-#### 1. **Cargo.toml (Packaging Config) - Rating: 8/10**
-   - **Strengths:** 
-     - Good dependency choices: `zip` and `walkdir` for build-time embedding, `rdev` conditionally for hotkeys (avoids Linux bloat), `dirs` for cross-platform paths.
-     - Release profile optimizations (`lto=true`, `strip=true`, `opt-level='z'`, `panic='abort'`) are excellent for a small daemon binary—reduces size and improves startup.
-     - Build-dependencies separated properly.
-   - **Issues/Bugs:**
-     - `sysinfo = "0.37.2"` is overkill if you're only using it for PID/process killing (in monitors.rs). It pulls in heavy deps; consider replacing with lighter alternatives like `libc` for Unix/Windows process APIs to shrink binary.
-     - `which = "8.0.0"` isn't used anywhere—dead dep? Remove to trim.
-     - `fs2 = "0.4"` for file locking is fine, but version is old (last update 2018); upgrade to `fs-lock` or use `std::sync::Mutex` with a file if possible.
-     - No explicit `target` configs beyond `.cargo/config.toml` (which is MUSL-specific). For Windows/Mac, add `[target.'cfg(windows)'.build-dependencies]` if needed for custom linkers.
-     - Missing dev-dependencies for testing (e.g., `tempfile` for extraction tests).
-   - **Packaging Suggestions:**
-     - Add `Cargo.lock` to repo for reproducible builds (especially since you're embedding hashes).
-     - For deployment, specify `bin` in `[package]` if shipping as a crate: `[bin] name = "spatialshot-daemon" path = "src/main.rs"`.
-     - To handle MUSL fully, add a profile for static linking: `[profile.release] codegen-units = 1`.
-   - **Deployment Notes:** Integrates well with Tauri `externalBin`, but ensure Tauri's bundler signs the daemon (e.g., via `tauri.conf.json`). Test AV scanning—embedded ZIPs can flag as suspicious; consider UPX compression post-build but watch for false positives.
-
-#### 2. **build.rs - Rating: 7/10**
-   - **Strengths:** 
-     - Great use of `println!("cargo:rerun-if-changed=dist");` for incremental builds.
-     - Dummy ZIP for `cargo check` is clever for dev workflow.
-     - SHA256 hashing for version integrity is a nice touch—prevents corrupted embeds.
-   - **Bugs/Issues:**
-     - **Panic in release if `dist` missing:** Good, but add a user-friendly message or env var override for CI.
-     - **Buffer reuse in `compress_dist`:** `let buffer = &mut Vec::new();` then `f.read_to_end(buffer)` and `zip.write_all(buffer)`—this is fine, but `buffer.clear()` after each file. Potential bug: If a file read fails midway, buffer might hold stale data—use a fresh vec per file or wrap in `Result`.
-     - **Unix permissions:** The `#[cfg(unix)]` block for permissions is inside the file write loop, but it sets perms on the output path after writing. Bug: If the file is executable in `dist/`, this preserves it, but on Windows-built ZIPs, it might not. Test extraction perms on Mac/Linux.
-     - **No compression level:** Using `Stored` is fast, but for a one-time embed, switch to `Deflated` for smaller binary: `.compression_method(zip::CompressionMethod::Deflated) .compression_level(Some(9))`.
-     - **WalkDir skips:** It skips root, good, but if `dist/` has symlinks, `filter_map(|e| e.ok())` ignores errors—log them.
-   - **Fix Suggestions:**
-     ```rust
-     // In compress_dist, per-file buffer and error handling
-     for entry in walk.into_iter().filter_map(|e| e.ok()) {
-         let path = entry.path();
-         if path == src_dir { continue; }
-         let name = path.strip_prefix(src_dir).unwrap().to_str().unwrap();
-         if path.is_file() {
-             let mut buffer = Vec::new(); // Fresh per file
-             let mut f = File::open(path).map_err(|e| anyhow!("Failed to open {:?}: {}", path, e))?;
-             f.read_to_end(&mut buffer).map_err(|e| anyhow!("Failed to read {:?}: {}", path, e))?;
-             zip.start_file(name, options).map_err(|e| anyhow!("Zip start failed for {}: {}", name, e))?;
-             zip.write_all(&buffer).map_err(|e| anyhow!("Zip write failed for {}: {}", name, e))?;
-         } else if !name.is_empty() {
-             zip.add_directory(name, options).map_err(|e| anyhow!("Dir add failed for {}: {}", name, e))?;
-         }
-     }
-     ```
-     - Add integrity check: After zipping, read back and verify hash in build.rs.
-   - **Packaging/Deployment:** Ties well to PKGBUILD scripts. For cross-compilation (e.g., build Linux on Mac), add `cargo build --target x86_64-unknown-linux-musl`.
-
-#### 3. **src/main.rs - Rating: 8/10**
-   - **Strengths:** Platform cfg for Linux (one-shot) vs. Win/Mac (daemon) is clean. Logger init is good.
-   - **Bugs/Issues:**
-     - **Global hotkey listener blocks:** `rdev::listen` is blocking, so the thread runs forever—fine for daemon, but no graceful shutdown. Add signal handling (e.g., `ctrlc` crate) to exit cleanly.
-     - **Error handling in callback:** The hotkey callback ignores errors from `lib::capture::run` and `ipc::tauri::open_editor`—log and continue, but user might not notice failures.
-     - **Linux path:** Assumes Tauri handles hotkey via OS shortcuts—good, but ensure daemon exits cleanly after capture (it does via `return Ok(())`).
-     - **`sys::monitors::start_monitor();` called before hotkey:** Good ordering, but if monitors change before hotkey, it updates `last_count`—potential race if hotkey fires immediately.
-   - **Fix Suggestions:**
-     ```rust
-     // In hotkey callback
-     if let Err(e) = lib::lock::try_lock() {
-         log::warn!("Capture already in progress: {}", e);
-         return;
-     }
-     let _audio_guard = sys::audio::AudioGuard::new();
-     if let Ok(image_path) = lib::capture::run(&engine_path) {
-         if let Err(e) = ipc::tauri::open_editor(&image_path) {
-             error!("Editor open failed: {}", e);
-             // Optionally notify user via tray or something
-         }
-     } else {
-         error!("Capture run failed"); // Add err var
-     }
-     ```
-   - **Deployment:** For Win/Mac daemon persistence, you mentioned plist/Registry—implement in Tauri installer, not here. Test daemon respawn if killed.
-
-#### 4. **src/lib/bootstrap.rs - Rating: 9/10**
-   - **Strengths:** Idempotent extraction with version check is excellent. ZIP slip protection via `enclosed_name()` is secure.
-   - **Bugs/Issues:**
-     - **No atomic extraction:** If fails mid-way, partial dir left—use temp dir + rename.
-     - **Unix perms:** Good, but on Mac, `xattr` in separate fn—ensure it's called recursively if needed.
-     - **Path resolution:** `get_binary_path` hardcodes names—make dynamic if C++ changes.
-     - **Error chaining:** Uses `anyhow`, good, but add contexts like `.context(format!("Extracting to {:?}", target_dir))`.
-   - **Fix Suggestions:**
-     ```rust
-     // Atomic extraction
-     fn install_engine(target_dir: &Path) -> Result<()> {
-         let temp_dir = target_dir.with_file_name(format!("engine_temp_{}", rand::random::<u32>()));
-         fs::create_dir_all(&temp_dir)?;
-         // Extract to temp_dir...
-         // On success:
-         fs::rename(&temp_dir, target_dir)?;
-         Ok(())
-     }
-     ```
-
-#### 5. **src/sys/hotkey.rs - Rating: 7/10**
-   - **Strengths:** Debounce with `Instant` is smart for double-taps.
-   - **Bugs/Issues:**
-     - **Key state globals:** Arc<AtomicBool> is fine, but consider a struct for all keys.
-     - **No error in listen:** If `rdev` fails (e.g., permissions), daemon hangs—wrap in thread and monitor.
-     - **Meta key:** On Win, Meta is Windows key—confirm it matches user expectation (Win+Shift+A).
-
-#### 6. **src/sys/monitors.rs - Rating: 6/10**
-   - **Strengths:** Threaded watchdog is crucial for your "ghost" prevention.
-   - **Bugs/Issues:**
-     - **Global PID unsafe:** `static mut`? No, you used `AtomicU32`—good, but add fences if multi-thread reads.
-     - **Kill on Linux exits daemon:** Abrupt; consider signaling Tauri.
-     - **Count methods:** Mac uses `core-graphics` (dep ok), Linux parses `xrandr`—fragile if no xrandr; use `x11rb` for robustness. Win uses `windows` crate—good.
-     - **Sleep 1s:** Too coarse; if plug/unplug during capture, 1s delay might not catch—poll faster (200ms) but CPU-friendly.
-   - **Fix:** Add timeout to loop if no capture for hours (power save).
-
-#### 7. **src/sys/audio.rs - Rating: 8/10**
-   - **Strengths:** RAII guard with Drop is perfect for temp mute.
-   - **Issues:** Backend detection assumes commands exist—use `which` (but you have it, unused). Parse outputs more robustly (regex for "muted: yes").
-   - **Deployment:** On Wayland, `wpctl` good; test Gnome specifically.
-
-#### Other Files
-- **ipc/tauri.rs:** URL scheme is ideal for Tauri wakeup. Bug: Path quoting—use `url::Url` to encode `path=`.
-- **lib/lock.rs:** Unsafe global `LOCK_FILE`—leak is intentional, but use `lazy_static` or thread-local.
-- **lib/capture.rs:** Timeout good; verify image with `image::open` if paranoid.
-
-#### Overall Bug Summary and Tests
-- Critical Bugs: Partial extraction, blocking listener without shutdown.
-- To test: Use code_execution tool? But since it's system-specific, suggest unit tests for bootstrap (mock ZIP).
-- Packaging: Binary size ~5-10MB post-embed—optimize with `upx`.
-- Deployment: For Tauri, add self-update for daemon (download new binary, replace). Test on VMs for AV/plug-unplug.
-
-I still support the Matryoshka architecture—it's elegant for your use case. If you implement fixes, send updated code for re-review!
-===
-
-senior 4:
-===
-Nice — solid details. I went through the Rust side and CI bits and pulled together **targeted, copy-pasteable fixes** you can apply immediately. I focused on correctness, concurrency, atomic extraction, locking, monitor shutdown behavior, and a few CI/build bugs that would stop the Matryoshka flow.
-
-Below: a prioritized list of issues + exact code patches (short, safe, ready to paste). Do them in order — the first ones fix hard crashes / data-corruption; the rest are robustness/CI improvements.
-
----
-
-# **Critical fixes (apply now)**
-
-### 1) `build.rs` — fix SHA256 hashing bug & make `cargo:rerun-if-changed` robust
-
-**Problems**
-
-* `calculate_sha256` used `std::io::copy(&mut file, &mut hasher)` — `hasher` is not an `io::Write`. This panics/compiles error.
-* `println!("cargo:rerun-if-changed=dist")` doesn't detect changes inside `dist`. Better emit a line per file so Cargo reruns when any dist file changes.
-
-**Patch** — replace whole `calculate_sha256` and add a small walk to emit `rerun-if-changed` entries:
-
-```rust
-// top: add
-use std::io::BufReader;
-
-// Replace the earlier println rerun-if-changed with this:
-for entry in WalkDir::new(&dist_path).into_iter().filter_map(|e| e.ok()) {
-    if entry.file_type().is_file() {
-        println!("cargo:rerun-if-changed={}", entry.path().display());
-    }
-}
-
-// Replace calculate_sha256 with:
-fn calculate_sha256(path: &Path) -> String {
-    let f = File::open(path).expect("Failed to open zip for hashing");
-    let mut reader = BufReader::new(f);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buffer[..n]),
-            Err(e) => panic!("Failed to read zip for hashing: {}", e),
-        }
-    }
-    hex::encode(hasher.finalize())
-}
-```
-
-(You already imported `WalkDir`; `BufReader` + `read` require `use std::io::Read;` which is present.)
-
----
-
-### 2) `src/lib/bootstrap.rs` — atomic, locked extraction + version check
-
-**Problems**
-
-* Extraction writes directly into `engine_dir` (partial installs possible).
-* No extraction lock: simultaneous starts can race.
-* No same-filesystem atomic swap.
-
-**Goal**
-
-* Extract to a temp directory next to `engine_dir` then rename (atomic on same FS).
-* Use a lock file (fs2) to prevent concurrent extraction.
-* Write version file only after successful swap.
-
-**Patch** — replace `ensure_engine` / `install_engine` with this implementation (drop-in):
-
-```rust
-use fs2::FileExt;
-use std::fs::File;
-use tempfile::tempdir_in;
-use std::io::Cursor;
-
-pub fn ensure_engine() -> Result<PathBuf> {
-    let data_dir = dirs::data_local_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine AppData directory"))?
-        .join("SpatialShot");
-
-    let engine_dir = data_dir.join("engine");
-    let version_marker = engine_dir.join("version.txt");
-
-    // Create parent dir
-    if let Some(parent) = engine_dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Lock file path (next to engine dir)
-    let lock_path = data_dir.join("engine_extract.lock");
-    let lock_file = File::create(&lock_path).context("Failed to create lock file")?;
-    // Acquire exclusive lock (blocks until we get it)
-    lock_file.lock_exclusive().context("Failed to acquire extraction lock")?;
-
-    // Ensure we always release lock at function exit
-    let _guard = scopeguard::guard(lock_file, |f| {
-        let _ = f.unlock();
-    });
-
-    // If engine exists and matches version -> return
-    if engine_dir.exists() {
-        if let Ok(current_ver) = std::fs::read_to_string(&version_marker) {
-            if current_ver.trim() == ENGINE_VERSION {
-                return get_binary_path(&engine_dir);
-            } else {
-                log::warn!(
-                    "Engine version mismatch (found {}, target {}). Reinstalling.",
-                    current_ver.trim(),
-                    ENGINE_VERSION
-                );
-                let _ = std::fs::remove_dir_all(&engine_dir);
-            }
-        } else {
-            log::warn!("Engine exists but version file unreadable. Reinstalling.");
-            let _ = std::fs::remove_dir_all(&engine_dir);
-        }
-    }
-
-    // Extract to temporary directory in same parent (so rename is atomic)
-    let parent_dir = engine_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Engine dir parent missing"))?;
-    let tmp = tempdir_in(parent_dir)?;
-    let tmp_engine = tmp.path().join("engine_tmp");
-
-    // Perform extraction into tmp_engine
-    std::fs::create_dir_all(&tmp_engine)?;
-    let mut archive = zip::ZipArchive::new(Cursor::new(PAYLOAD_ZIP))?;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(p) => tmp_engine.join(p),
-            None => continue,
-        };
-
-        if file.name().ends_with('/') {
-            std::fs::create_dir_all(&outpath)?;
-            continue;
-        }
-
-        if let Some(p) = outpath.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-
-        let mut outfile = std::fs::File::create(&outpath)?;
-        std::io::copy(&mut file, &mut outfile)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = file.unix_mode() {
-                std::fs::set_permissions(&outpath, std::fs::Permissions::from_mode(mode))?;
-            }
-        }
-    }
-
-    // macOS quarantine removal (best-effort)
-    #[cfg(target_os = "macos")]
-    {
-        let _ = remove_quarantine(&tmp_engine);
-    }
-
-    // Atomic rename into place
-    if engine_dir.exists() {
-        std::fs::remove_dir_all(&engine_dir)?;
-    }
-    std::fs::rename(&tmp_engine, &engine_dir)?;
-
-    // Write version marker
-    std::fs::write(engine_dir.join("version.txt"), ENGINE_VERSION)?;
-
-    get_binary_path(&engine_dir)
-}
-```
-
-**Notes**
-
-* This uses `tempfile` and `fs2`. Add these crates:
-
-  ```toml
-  once_cell = "1.18"      # if you plan to use it later
-  tempfile = "3"
-  scopeguard = "1.2"
-  ```
-
-  (You can remove `once_cell` if unused.)
-* This guarantees atomic swap (rename on same FS) and prevents concurrent extraction.
-
----
-
-### 3) `src/lib/lock.rs` — replace `static mut` with safe global using `once_cell`
-
-**Problems**
-
-* `static mut` is unsafe and not thread-safe.
-
-**Patch** — replace file contents with:
-
-```rust
-use anyhow::Result;
-use fs2::FileExt;
-use std::fs::File;
-use std::path::PathBuf;
-use once_cell::sync::OnceCell;
-
-static LOCK_FILE: OnceCell<File> = OnceCell::new();
-
-pub fn try_lock() -> Result<()> {
-    let temp_dir = std::env::temp_dir();
-    let lock_path = temp_dir.join("spatialshot.lock");
-
-    let file = File::create(&lock_path)?;
-    file.try_lock_exclusive().context("Capture is already running")?;
-
-    // store the file so it lives until process exit or explicit unlock
-    LOCK_FILE.set(file).ok(); // ignore if already set (shouldn't happen)
-    Ok(())
-}
-
-pub fn unlock() {
-    if let Some(file) = LOCK_FILE.get() {
-        let _ = file.unlock();
-        // don't remove the file; OS will clean or next run will reuse.
-    }
-}
-```
-
-Add `once_cell` to `Cargo.toml` if you haven't.
-
----
-
-### 4) `src/sys/monitors.rs` — ensure daemon kills itself when monitors change
-
-**Problems**
-
-* `emergency_shutdown` only `std::process::exit(1)` on Linux. User explicitly wanted the daemon to kill itself on any OS change.
-
-**Patch** — change `emergency_shutdown` to exit the process on all OSes after killing child:
-
-```rust
-fn emergency_shutdown(pid: u32) {
-    let _ = kill_process(pid);
-    // Best-effort cleanup then exit to allow system to restore normal state
-    log::warn!("Exiting daemon due to monitor topology change.");
-    std::process::exit(1);
-}
-```
-
-(Just remove the `#[cfg(target_os = "linux")]` guard so all platforms exit.)
-
-**Note:** if you want graceful shutdown hooks, call them before `exit`. But immediate exit is fine here since you purposely want to avoid inconsistent frozen state.
-
----
-
-### 5) `src/sys/audio.rs` — make backend detection robust
-
-**Problems**
-
-* Some audio tools print to `stderr`, or their output format varies. `pactl` `get-sink-mute` output might require parsing. Also current code sets `backend` even when the command exists but parsing failed.
-
-**Patch** — more robust `pactl` handling and prefer `pactl list short sinks` fallback. Minimal replacement for `try_backend`:
-
-```rust
-fn try_backend(&mut self, cmd: &'static str, check_args: &[&str], mute_args: &[&str]) -> bool {
-    let out = Command::new(cmd).args(check_args).output();
-    if let Ok(output) = out {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{}{}", stdout, stderr).to_lowercase();
-
-        // Simple heuristics
-        let is_muted = combined.contains("mute") && (combined.contains("yes") || combined.contains("1") || combined.contains("true") || combined.contains("[on]") || combined.contains("[off]") || combined.contains("[mute]"));
-
-        // If the command ran, assume it's a valid backend
-        self.backend = Some(cmd);
-        self.was_previously_muted = is_muted;
-
-        if !self.was_previously_muted {
-            let _ = Command::new(cmd).args(mute_args).output();
-            self.muted_by_us = true;
-        }
-        return true;
-    }
-    false
-}
-```
-
-Also ensure the `new()` function tries `pactl` with `["get-sink-mute", "@DEFAULT_SINK@"]` first. If that produces no output, try `pactl list short sinks` and parse the default sink index.
-
-This is heuristic but significantly more tolerant across distros.
-
----
-
-# **CI / packaging immediate fixes**
-
-### 6) `.github/actions/build-pkg/action.yml` — wrong working dir
-
-**Problem**
-
-* The action uses `working-directory: ./packages/daemon` but your crate is `packages/capture`. That will fail.
-
-**Patch**
-Change:
-
-```yaml
-working-directory: ./packages/daemon
-```
-
-to:
-
-```yaml
-working-directory: ./packages/capture
-```
-
-Also ensure the `BIN_PATH` later references `packages/capture/target/release/spatialshot-daemon` (you already do in the workflow but the action zipped different folder). Do a quick sweep for other `daemon` vs `capture` mismatches.
-
----
-
-# **Recommended (non-critical) improvements**
-
-* **Add extraction lock path override**: allow `SPATIALSHOT_ENGINE_DIR` env var so devs can extract to a custom dir for QA.
-* **Expose `daemon --repair`**: re-extract and force overwrite if user has corrupt install.
-* **Logging**: add file logger to AppData so users can attach logs for triage.
-* **Hotkey startup (mac/windows)**: instruct installers to register LaunchAgent / HKCU registry key. Provide sample plist and `.reg` or PowerShell invocations in your Tauri installer step (you already mentioned them).
-* **Testability**: add a `--smoketest` flag that runs `lib::capture::run()` but uses a dummy executable when running in CI so you can test monitor logic without GUI freeze.
-
----
-
-# **Crate changes to add to Cargo.toml**
-
-Add these runtime deps:
-
+### **10. CARGO.TOML: ADD MISSING DEPENDENCIES**
 ```toml
-tempfile = "3"
-scopeguard = "1.2"
-once_cell = "1.18"
+# Add to Cargo.toml
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }  # Async runtime
+nix = "0.27"  # For proper file locking on Unix
+serde_json = "1.0"  # For Wayland JSON parsing
+crossbeam-channel = "0.5"  # Better than std::sync::mpsc
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = { version = "0.31", optional = true }  # Wayland support
+
+[features]
+wayland = ["wayland-client"]  # Optional Wayland feature
 ```
 
-(You already have `fs2`.)
-
----
-
-# **How to apply quickly**
-
-1. Patch `build.rs` (sha256 + rerun-if-changed). Build will error until fixed.
-2. Add `tempfile`, `once_cell`, `scopeguard` to `Cargo.toml`.
-3. Replace `src/lib/bootstrap.rs` with the atomic extraction version.
-4. Replace `src/lib/lock.rs` with the OnceCell version.
-5. Patch `src/sys/monitors.rs` emergency shutdown as above.
-6. Tweak `src/sys/audio.rs` `try_backend` as above.
-7. Fix `.github/actions/build-pkg/action.yml` working dir to `packages/capture`.
-
-After that, run `cargo build` locally (in debug) and test:
-
-* Simulate two concurrent starts to verify extraction lock.
-* Toggle monitor count (plug/unplug) during capture to validate emergency path.
-* Trigger hotkey on mac/windows dev machine to ensure rdev listener and audio guard behave.
-
----
-
-# Quick notes / gotchas
-
-* Signing: sign the inner native binary **before embedding** so signatures persist on extraction. You already sign in CI for mac with `codesign` — ensure this happens before zip embedding.
-* AVs: big single binaries sometimes trigger heuristics. Sign release artifacts and keep a reproducible build flow.
-* `rename` atomicity requires same filesystem — ensure your installer/daemon extracts to a path on same FS as temp dir (we used `tempdir_in(parent)` for that reason).
-* `xattr -d com.apple.quarantine` may fail if user lacks permission — we run it best-effort.
-
----
-
-If you want, I’ll:
-
-* generate a small PR patch for each file (I can paste full file contents),
-* or run through one file at a time (start with `build.rs` + `bootstrap.rs`) and produce the exact full file content ready to commit.
-
-Tell me which option and I’ll drop the full replacement files next — or I can start by pasting the full updated `build.rs` + `bootstrap.rs` now. Which do you want?
-===
-
-senior 5:
-===
-Nice — solid details. I went through the Rust side and CI bits and pulled together **targeted, copy-pasteable fixes** you can apply immediately. I focused on correctness, concurrency, atomic extraction, locking, monitor shutdown behavior, and a few CI/build bugs that would stop the Matryoshka flow.
-
-Below: a prioritized list of issues + exact code patches (short, safe, ready to paste). Do them in order — the first ones fix hard crashes / data-corruption; the rest are robustness/CI improvements.
-
----
-
-# **Critical fixes (apply now)**
-
-### 1) `build.rs` — fix SHA256 hashing bug & make `cargo:rerun-if-changed` robust
-
-**Problems**
-
-* `calculate_sha256` used `std::io::copy(&mut file, &mut hasher)` — `hasher` is not an `io::Write`. This panics/compiles error.
-* `println!("cargo:rerun-if-changed=dist")` doesn't detect changes inside `dist`. Better emit a line per file so Cargo reruns when any dist file changes.
-
-**Patch** — replace whole `calculate_sha256` and add a small walk to emit `rerun-if-changed` entries:
-
-```rust
-// top: add
-use std::io::BufReader;
-
-// Replace the earlier println rerun-if-changed with this:
-for entry in WalkDir::new(&dist_path).into_iter().filter_map(|e| e.ok()) {
-    if entry.file_type().is_file() {
-        println!("cargo:rerun-if-changed={}", entry.path().display());
-    }
-}
-
-// Replace calculate_sha256 with:
-fn calculate_sha256(path: &Path) -> String {
-    let f = File::open(path).expect("Failed to open zip for hashing");
-    let mut reader = BufReader::new(f);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buffer[..n]),
-            Err(e) => panic!("Failed to read zip for hashing: {}", e),
-        }
-    }
-    hex::encode(hasher.finalize())
-}
-```
-
-(You already imported `WalkDir`; `BufReader` + `read` require `use std::io::Read;` which is present.)
-
----
-
-### 2) `src/lib/bootstrap.rs` — atomic, locked extraction + version check
-
-**Problems**
-
-* Extraction writes directly into `engine_dir` (partial installs possible).
-* No extraction lock: simultaneous starts can race.
-* No same-filesystem atomic swap.
-
-**Goal**
-
-* Extract to a temp directory next to `engine_dir` then rename (atomic on same FS).
-* Use a lock file (fs2) to prevent concurrent extraction.
-* Write version file only after successful swap.
-
-**Patch** — replace `ensure_engine` / `install_engine` with this implementation (drop-in):
-
-```rust
-use fs2::FileExt;
-use std::fs::File;
-use tempfile::tempdir_in;
-use std::io::Cursor;
-
-pub fn ensure_engine() -> Result<PathBuf> {
-    let data_dir = dirs::data_local_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine AppData directory"))?
-        .join("SpatialShot");
-
-    let engine_dir = data_dir.join("engine");
-    let version_marker = engine_dir.join("version.txt");
-
-    // Create parent dir
-    if let Some(parent) = engine_dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Lock file path (next to engine dir)
-    let lock_path = data_dir.join("engine_extract.lock");
-    let lock_file = File::create(&lock_path).context("Failed to create lock file")?;
-    // Acquire exclusive lock (blocks until we get it)
-    lock_file.lock_exclusive().context("Failed to acquire extraction lock")?;
-
-    // Ensure we always release lock at function exit
-    let _guard = scopeguard::guard(lock_file, |f| {
-        let _ = f.unlock();
-    });
-
-    // If engine exists and matches version -> return
-    if engine_dir.exists() {
-        if let Ok(current_ver) = std::fs::read_to_string(&version_marker) {
-            if current_ver.trim() == ENGINE_VERSION {
-                return get_binary_path(&engine_dir);
-            } else {
-                log::warn!(
-                    "Engine version mismatch (found {}, target {}). Reinstalling.",
-                    current_ver.trim(),
-                    ENGINE_VERSION
-                );
-                let _ = std::fs::remove_dir_all(&engine_dir);
-            }
-        } else {
-            log::warn!("Engine exists but version file unreadable. Reinstalling.");
-            let _ = std::fs::remove_dir_all(&engine_dir);
-        }
-    }
-
-    // Extract to temporary directory in same parent (so rename is atomic)
-    let parent_dir = engine_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Engine dir parent missing"))?;
-    let tmp = tempdir_in(parent_dir)?;
-    let tmp_engine = tmp.path().join("engine_tmp");
-
-    // Perform extraction into tmp_engine
-    std::fs::create_dir_all(&tmp_engine)?;
-    let mut archive = zip::ZipArchive::new(Cursor::new(PAYLOAD_ZIP))?;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(p) => tmp_engine.join(p),
-            None => continue,
-        };
-
-        if file.name().ends_with('/') {
-            std::fs::create_dir_all(&outpath)?;
-            continue;
-        }
-
-        if let Some(p) = outpath.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-
-        let mut outfile = std::fs::File::create(&outpath)?;
-        std::io::copy(&mut file, &mut outfile)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = file.unix_mode() {
-                std::fs::set_permissions(&outpath, std::fs::Permissions::from_mode(mode))?;
-            }
-        }
-    }
-
-    // macOS quarantine removal (best-effort)
-    #[cfg(target_os = "macos")]
-    {
-        let _ = remove_quarantine(&tmp_engine);
-    }
-
-    // Atomic rename into place
-    if engine_dir.exists() {
-        std::fs::remove_dir_all(&engine_dir)?;
-    }
-    std::fs::rename(&tmp_engine, &engine_dir)?;
-
-    // Write version marker
-    std::fs::write(engine_dir.join("version.txt"), ENGINE_VERSION)?;
-
-    get_binary_path(&engine_dir)
-}
-```
-
-**Notes**
-
-* This uses `tempfile` and `fs2`. Add these crates:
-
-  ```toml
-  once_cell = "1.18"      # if you plan to use it later
-  tempfile = "3"
-  scopeguard = "1.2"
-  ```
-
-  (You can remove `once_cell` if unused.)
-* This guarantees atomic swap (rename on same FS) and prevents concurrent extraction.
-
----
-
-### 3) `src/lib/lock.rs` — replace `static mut` with safe global using `once_cell`
-
-**Problems**
-
-* `static mut` is unsafe and not thread-safe.
-
-**Patch** — replace file contents with:
-
-```rust
-use anyhow::Result;
-use fs2::FileExt;
-use std::fs::File;
-use std::path::PathBuf;
-use once_cell::sync::OnceCell;
-
-static LOCK_FILE: OnceCell<File> = OnceCell::new();
-
-pub fn try_lock() -> Result<()> {
-    let temp_dir = std::env::temp_dir();
-    let lock_path = temp_dir.join("spatialshot.lock");
-
-    let file = File::create(&lock_path)?;
-    file.try_lock_exclusive().context("Capture is already running")?;
-
-    // store the file so it lives until process exit or explicit unlock
-    LOCK_FILE.set(file).ok(); // ignore if already set (shouldn't happen)
-    Ok(())
-}
-
-pub fn unlock() {
-    if let Some(file) = LOCK_FILE.get() {
-        let _ = file.unlock();
-        // don't remove the file; OS will clean or next run will reuse.
-    }
-}
-```
-
-Add `once_cell` to `Cargo.toml` if you haven't.
-
----
-
-### 4) `src/sys/monitors.rs` — ensure daemon kills itself when monitors change
-
-**Problems**
-
-* `emergency_shutdown` only `std::process::exit(1)` on Linux. User explicitly wanted the daemon to kill itself on any OS change.
-
-**Patch** — change `emergency_shutdown` to exit the process on all OSes after killing child:
-
-```rust
-fn emergency_shutdown(pid: u32) {
-    let _ = kill_process(pid);
-    // Best-effort cleanup then exit to allow system to restore normal state
-    log::warn!("Exiting daemon due to monitor topology change.");
-    std::process::exit(1);
-}
-```
-
-(Just remove the `#[cfg(target_os = "linux")]` guard so all platforms exit.)
-
-**Note:** if you want graceful shutdown hooks, call them before `exit`. But immediate exit is fine here since you purposely want to avoid inconsistent frozen state.
-
----
-
-### 5) `src/sys/audio.rs` — make backend detection robust
-
-**Problems**
-
-* Some audio tools print to `stderr`, or their output format varies. `pactl` `get-sink-mute` output might require parsing. Also current code sets `backend` even when the command exists but parsing failed.
-
-**Patch** — more robust `pactl` handling and prefer `pactl list short sinks` fallback. Minimal replacement for `try_backend`:
-
-```rust
-fn try_backend(&mut self, cmd: &'static str, check_args: &[&str], mute_args: &[&str]) -> bool {
-    let out = Command::new(cmd).args(check_args).output();
-    if let Ok(output) = out {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{}{}", stdout, stderr).to_lowercase();
-
-        // Simple heuristics
-        let is_muted = combined.contains("mute") && (combined.contains("yes") || combined.contains("1") || combined.contains("true") || combined.contains("[on]") || combined.contains("[off]") || combined.contains("[mute]"));
-
-        // If the command ran, assume it's a valid backend
-        self.backend = Some(cmd);
-        self.was_previously_muted = is_muted;
-
-        if !self.was_previously_muted {
-            let _ = Command::new(cmd).args(mute_args).output();
-            self.muted_by_us = true;
-        }
-        return true;
-    }
-    false
-}
-```
-
-Also ensure the `new()` function tries `pactl` with `["get-sink-mute", "@DEFAULT_SINK@"]` first. If that produces no output, try `pactl list short sinks` and parse the default sink index.
-
-This is heuristic but significantly more tolerant across distros.
-
----
-
-# **CI / packaging immediate fixes**
-
-### 6) `.github/actions/build-pkg/action.yml` — wrong working dir
-
-**Problem**
-
-* The action uses `working-directory: ./packages/daemon` but your crate is `packages/capture`. That will fail.
-
-**Patch**
-Change:
-
+### **11. GITHUB ACTIONS: ADD CACHE**
 ```yaml
-working-directory: ./packages/daemon
+# Add to distribute.yml
+- name: Cache Cargo registry
+  uses: actions/cache@v3
+  with:
+    path: ~/.cargo/registry
+    key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+- name: Cache Cargo build
+  uses: actions/cache@v3
+  with:
+    path: target
+    key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
 ```
 
-to:
+## 🚀 **PRODUCTION DEPLOYMENT CHECKLIST**
 
-```yaml
-working-directory: ./packages/capture
-```
+1. **Signing**: Add `codesign` step for macOS in CI
+2. **Notarization**: For macOS, add notarization via `xcrun notarytool`
+3. **Windows Authenticode**: Add `signtool` step in Windows CI
+4. **Linux AppStream**: Create `.metainfo.xml` for Flathub
+5. **Update Channels**: Implement Tauri auto-updater with version checking
+6. **Crash Reporting**: Add `sentry` or `backtrace` integration
+7. **Analytics**: Add opt-in telemetry (capture success/failure rates)
+8. **Documentation**: Generate man pages with `scdoc`
 
-Also ensure the `BIN_PATH` later references `packages/capture/target/release/spatialshot-daemon` (you already do in the workflow but the action zipped different folder). Do a quick sweep for other `daemon` vs `capture` mismatches.
+## 📊 **ARCHITECTURE RATING: 9/10**
 
----
+**Strengths:**
+- Brilliant "Matryoshka" distribution model
+- Clean separation of concerns
+- Platform-specific optimizations well thought out
+- Good error handling patterns
+- Efficient use of AppData instead of temp
 
-# **Recommended (non-critical) improvements**
+**Areas for Improvement:**
+1. Add proper async/await throughout
+2. Implement circuit breaker pattern for IPC
+3. Add health checks for daemon lifecycle
+4. Consider using `tokio` instead of `std::thread`
 
-* **Add extraction lock path override**: allow `SPATIALSHOT_ENGINE_DIR` env var so devs can extract to a custom dir for QA.
-* **Expose `daemon --repair`**: re-extract and force overwrite if user has corrupt install.
-* **Logging**: add file logger to AppData so users can attach logs for triage.
-* **Hotkey startup (mac/windows)**: instruct installers to register LaunchAgent / HKCU registry key. Provide sample plist and `.reg` or PowerShell invocations in your Tauri installer step (you already mentioned them).
-* **Testability**: add a `--smoketest` flag that runs `lib::capture::run()` but uses a dummy executable when running in CI so you can test monitor logic without GUI freeze.
+**Recommendation:** Stick with this architecture! It's superior to polyglot mono-repo because:
+- ✅ Single installation experience
+- ✅ No dependency conflicts  
+- ✅ Smaller attack surface
+- ✅ Easier updates
+- ✅ Better platform integration
 
----
-
-# **Crate changes to add to Cargo.toml**
-
-Add these runtime deps:
-
-```toml
-tempfile = "3"
-scopeguard = "1.2"
-once_cell = "1.18"
-```
-
-(You already have `fs2`.)
-
----
-
-# **How to apply quickly**
-
-1. Patch `build.rs` (sha256 + rerun-if-changed). Build will error until fixed.
-2. Add `tempfile`, `once_cell`, `scopeguard` to `Cargo.toml`.
-3. Replace `src/lib/bootstrap.rs` with the atomic extraction version.
-4. Replace `src/lib/lock.rs` with the OnceCell version.
-5. Patch `src/sys/monitors.rs` emergency shutdown as above.
-6. Tweak `src/sys/audio.rs` `try_backend` as above.
-7. Fix `.github/actions/build-pkg/action.yml` working dir to `packages/capture`.
-
-After that, run `cargo build` locally (in debug) and test:
-
-* Simulate two concurrent starts to verify extraction lock.
-* Toggle monitor count (plug/unplug) during capture to validate emergency path.
-* Trigger hotkey on mac/windows dev machine to ensure rdev listener and audio guard behave.
-
----
-
-# Quick notes / gotchas
-
-* Signing: sign the inner native binary **before embedding** so signatures persist on extraction. You already sign in CI for mac with `codesign` — ensure this happens before zip embedding.
-* AVs: big single binaries sometimes trigger heuristics. Sign release artifacts and keep a reproducible build flow.
-* `rename` atomicity requires same filesystem — ensure your installer/daemon extracts to a path on same FS as temp dir (we used `tempdir_in(parent)` for that reason).
-* `xattr -d com.apple.quarantine` may fail if user lacks permission — we run it best-effort.
-
----
-
-If you want, I’ll:
-
-* generate a small PR patch for each file (I can paste full file contents),
-* or run through one file at a time (start with `build.rs` + `bootstrap.rs`) and produce the exact full file content ready to commit.
-
-Tell me which option and I’ll drop the full replacement files next — or I can start by pasting the full updated `build.rs` + `bootstrap.rs` now. Which do you want?
+The bugs are fixable and don't require architectural changes. Your design is production-ready with these fixes.
 ===
