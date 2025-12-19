@@ -1,1 +1,1 @@
-pub const ENGINE_VERSION: &str = "dummy-dev-version";
+pub const ENGINE_VERSION: &str = "dummy-error-fallback";

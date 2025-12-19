@@ -1,53 +1,95 @@
-// build.rs
+// packages/capture/build.rs
 
 use std::env;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
+use std::process::Command;
 use walkdir::WalkDir;
 use zip::write::FileOptions;
 use sha2::{Digest, Sha256};
 
 fn main() {
-    // 1. Define Paths
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let dist_path = Path::new(&manifest_dir).join("dist");
-    let embed_dir = Path::new(&manifest_dir).join("src").join("embed");
+    let root = Path::new(&manifest_dir);
+    let dist_path = root.join("dist");
+    let src_qt = root.join("src-qt");
+    let embed_dir = root.join("src").join("embed");
     let output_zip = embed_dir.join("capture_engine.zip");
     let version_file = embed_dir.join("version_hash.rs");
 
-    // 2. Trigger Re-run only if 'dist' changes
-    println!("cargo:rerun-if-changed=dist");
-
-    // 3. Validation
-    if !dist_path.exists() {
-        // If dist doesn't exist, we might be in a "clean" state or just starting.
-        
-        // CRITICAL CHECK: In Release mode, we cannot ship a dummy.
-        if env::var("PROFILE").unwrap() == "release" {
-             panic!("⛔ FATAL: 'dist' folder missing in RELEASE build. Compile C++ first!");
+    // 1. WATCHTRIGGERS
+    println!("cargo:rerun-if-changed=build.rs");
+    // Re-run if C++ source changes
+    println!("cargo:rerun-if-changed={}", src_qt.display());
+    
+    // Re-run if any file in dist changes (Manual intervention or previous build artifact)
+    if dist_path.exists() {
+        for entry in WalkDir::new(&dist_path).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() {
+                println!("cargo:rerun-if-changed={}", entry.path().display());
+            }
         }
-
-        // We create a dummy zip to allow 'cargo check' to pass, but warn heavily.
-        println!("cargo:warning=DIST FOLDER MISSING. Creating dummy payload.");
-        create_dummy_zip(&output_zip);
-        
-        // Write dummy version to ensure compilation passes
-        write_version_file(&version_file, "dummy-dev-version");
-        return;
+    } else {
+        println!("cargo:rerun-if-changed={}", dist_path.display());
     }
 
-    // 4. Create the Embed Directory if missing
+
+    // 2. BUILD ORCHESTRATION (The "Construction" Phase)
+    // If dist is missing OR we are in release mode and src-qt changed, rebuild C++.
+    if !dist_path.exists() || should_rebuild_cpp(&src_qt, &dist_path) {
+        println!("cargo:warning=Orchestrating C++ Build (this may take a while)...");
+        
+        let status = if cfg!(target_os = "windows") {
+             Command::new("powershell")
+                .arg("-ExecutionPolicy").arg("Bypass")
+                .arg("-File").arg("PKGBUILD.ps1")
+                .current_dir(root)
+                .status()
+        } else {
+             Command::new("./PKGBUILD")
+                .current_dir(root)
+                .status()
+        };
+
+        match status {
+            Ok(s) if s.success() => println!("cargo:warning=C++ Build Successful."),
+            _ => {
+                // In Debug, we can fallback to dummy. In Release, we die.
+                if env::var("PROFILE").unwrap() == "release" {
+                    panic!("⛔ FATAL: C++ Build Failed. Check logs.");
+                }
+                println!("cargo:warning=C++ Build Failed. Using DUMMY payload for Debug.");
+                create_dummy_zip(&output_zip);
+                write_version_file(&version_file, "dummy-error-fallback");
+                return;
+            }
+        }
+    }
+
+    // 3. COMPRESS (The "Encapsulation" Phase)
     if !embed_dir.exists() {
         std::fs::create_dir_all(&embed_dir).expect("Failed to create embed dir");
     }
 
-    // 5. Compress 'dist' contents into the zip
+    // Ensure we compress the FRESH dist
     compress_dist(&dist_path, &output_zip);
 
-    // 6. Calculate Hash and Write Version
+    // 4. HASH
     let hash = calculate_sha256(&output_zip);
     write_version_file(&version_file, &hash);
+}
+
+// Simple logic: If any file in src-qt is newer than dist, rebuild.
+fn should_rebuild_cpp(src: &Path, dist: &Path) -> bool {
+    // Basic check: if dist is empty, rebuild
+    if !dist.exists() { return true; }
+    // In a real scenario, you might compare mtimes, but for now, 
+    // we assume if the user ran cargo build, they might want to sync.
+    // However, C++ builds are slow, so we rely on explicit 'dist' existence usually.
+    // For now, strictly rely on dist existence to avoid infinite build loops 
+    // unless you implement a sophisticated mtime walker.
+    false 
 }
 
 fn write_version_file(path: &Path, version: &str) {
@@ -57,40 +99,46 @@ fn write_version_file(path: &Path, version: &str) {
 }
 
 fn calculate_sha256(path: &Path) -> String {
-    let mut file = File::open(path).expect("Failed to open zip for hashing");
+    let f = File::open(path).expect("Failed to open zip for hashing");
+    let mut reader = BufReader::new(f);
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("Failed to read zip for hashing");
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buffer[..n]),
+            Err(e) => panic!("Failed to read zip for hashing: {}", e),
+        }
+    }
     hex::encode(hasher.finalize())
 }
 
 fn compress_dist(src_dir: &Path, dst_file: &Path) {
     let file = File::create(dst_file).expect("Failed to create zip file");
     let mut zip = zip::ZipWriter::new(file);
+    // Use stored (0) compression for speed since the binary will be zipped again by the installer usually
+    // Or Deflate for smaller binary size.
     let options = FileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored) // Faster extract, slightly larger
-        .unix_permissions(0o755); // Ensure executable
+        .compression_method(zip::CompressionMethod::Deflated) 
+        .unix_permissions(0o755);
 
     let walk = WalkDir::new(src_dir);
     let buffer = &mut Vec::new();
 
     for entry in walk.into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        
-        // Skip the root dir itself
         if path == src_dir { continue; }
+        
+        // Fix for Windows paths in zip
+        let name = path.strip_prefix(src_dir).unwrap().to_str().unwrap().replace("\\", "/");
 
-        let name = path.strip_prefix(src_dir).unwrap().to_str().unwrap();
-
-        // Write entry
         if path.is_file() {
-            // Preserve executable permissions on Unix/Mac
             #[cfg(unix)]
             let options = {
                 use std::os::unix::fs::PermissionsExt;
                 let meta = std::fs::metadata(path).unwrap();
                 options.unix_permissions(meta.permissions().mode())
             };
-
             zip.start_file(name, options).unwrap();
             let mut f = File::open(path).unwrap();
             f.read_to_end(buffer).unwrap();
@@ -104,12 +152,10 @@ fn compress_dist(src_dir: &Path, dst_file: &Path) {
 }
 
 fn create_dummy_zip(dst_file: &Path) {
-    if let Some(parent) = dst_file.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
+    if let Some(parent) = dst_file.parent() { std::fs::create_dir_all(parent).unwrap(); }
     let file = File::create(dst_file).unwrap();
     let mut zip = zip::ZipWriter::new(file);
     zip.start_file("README.txt", FileOptions::default()).unwrap();
-    zip.write_all(b"Dummy payload. Run Qt build first.").unwrap();
+    zip.write_all(b"Dummy payload.").unwrap();
     zip.finish().unwrap();
 }

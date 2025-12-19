@@ -34,12 +34,12 @@ pub fn start_monitor() {
 
 fn emergency_shutdown(pid: u32) {
     let _ = kill_process(pid);
-    // On Linux, we also kill ourselves because internal X11 state might be de-synced
-    #[cfg(target_os = "linux")]
+    // Best-effort cleanup then exit to allow system to restore normal state
+    log::warn!("Exiting daemon due to monitor topology change.");
     std::process::exit(1);
 }
 
-fn kill_process(pid: u32) -> std::io::Result<()> {
+pub(crate) fn kill_process(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         // Polite kill

@@ -51,16 +51,16 @@ impl AudioGuard {
     }
 
     fn try_backend(&mut self, cmd: &'static str, check_args: &[&str], mute_args: &[&str]) -> bool {
-        if let Ok(output) = Command::new(cmd).args(check_args).output() {
-            let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        let out = Command::new(cmd).args(check_args).output();
+        if let Ok(output) = out {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let combined = format!("{}{}", stdout, stderr).to_lowercase();
 
-            // Check if already muted
-            let is_muted = out.contains("true")
-                || out.contains("yes")
-                || out.contains("on")
-                || out.contains("[off]")
-                || out.contains("[mute]");
+            // Simple heuristics
+            let is_muted = combined.contains("mute") && (combined.contains("yes") || combined.contains("1") || combined.contains("true") || combined.contains("[on]") || combined.contains("[off]") || combined.contains("[mute]"));
 
+            // If the command ran, assume it's a valid backend
             self.backend = Some(cmd);
             self.was_previously_muted = is_muted;
 
